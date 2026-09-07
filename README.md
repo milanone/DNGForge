@@ -11,6 +11,8 @@ ritrova praticamente identico e ancora pienamente editabile, e viceversa. Nessun
 il salvataggio scrive **sempre e solo dentro il DNG stesso**, requisito di progetto non
 negoziabile.
 
+![Screenshot di DNGForge](screenshot.png)
+
 ## Come funziona
 
 Ogni pixel mostrato o salvato viene renderizzato da **Adobe DNG Converter**, dipendenza runtime
