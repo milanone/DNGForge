@@ -15,13 +15,13 @@ il salvataggio scrive **sempre e solo dentro il DNG stesso**.
 ## Come funziona
 
 Ogni pixel mostrato o salvato viene renderizzato da **Adobe DNG Converter**, dipendenza runtime
-obbligatoria (l'app rifiuta di aprire file se non lo trova): `DNGForge.pyw` costruisce solo i tag
-XMP di editing e li passa al converter, non tocca mai i pixel direttamente.
+obbligatoria: `DNGForge.pyw` costruisce solo i tag XMP di editing e li passa al converter, non
+tocca mai i pixel direttamente.
 
 Unica eccezione: i tre strumenti di editing locale — filtro radiale, filtro graduato e rimozione
-macchie — non vengono renderizzati da Adobe DNG Converter (confermato non supportato dalla sua
-CLI), quindi per quei tre soli strumenti l'app compone i pixel localmente (OpenCV/Pillow) sopra il
-render Adobe.
+macchie — non vengono renderizzati da Adobe DNG Converter (non supportato dalla sua CLI), quindi
+per quei tre soli strumenti l'app compone i pixel localmente (OpenCV/Pillow) sopra il render
+Adobe.
 
 ## Stato / progetto collegato
 
