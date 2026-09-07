@@ -8,8 +8,7 @@ obiettivo, crop/raddrizzamento, undo/redo, pannello metadati EXIF, filmstrip a g
 tecnologia. DNGForge scrive le modifiche nei veri tag XMP `crs` di Adobe (Adobe DNG Converter è
 gratuito, a differenza di Lightroom) — un file elaborato qui, aperto in un vero Lightroom, si
 ritrova praticamente identico e ancora pienamente editabile, e viceversa. Nessun sidecar esterno:
-il salvataggio scrive **sempre e solo dentro il DNG stesso**, requisito di progetto non
-negoziabile.
+il salvataggio scrive **sempre e solo dentro il DNG stesso**.
 
 ![Screenshot di DNGForge](screenshot.png)
 
