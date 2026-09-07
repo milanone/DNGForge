@@ -23,12 +23,6 @@ macchie — non vengono renderizzati da Adobe DNG Converter (non supportato dall
 per quei tre soli strumenti l'app compone i pixel localmente (OpenCV/Pillow) sopra il render
 Adobe.
 
-## Stato / progetto collegato
-
-[DNGForgeLab](https://github.com/milanone/DNGForgeLab) è un fork di questo progetto che sta
-calibrando un motore di rendering nativo Python/rawpy, con l'obiettivo di arrivare un giorno a
-un'indipendenza da Adobe DNG Converter.
-
 ## Requisiti
 
 - Python 3.10+ e le dipendenze in `requirements.txt` (`pip install -r requirements.txt`)
