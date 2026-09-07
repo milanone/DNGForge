@@ -4,8 +4,12 @@ Editor RAW non distruttivo per file DNG, in stile Lightroom/Camera Raw: bilancia
 curva tonale, saturazione/nitidezza, filtri radiale e graduato, rimozione macchie, correzione
 obiettivo, crop/raddrizzamento, undo/redo, pannello metadati EXIF, filmstrip a galleria.
 
-Requisito di progetto non negoziabile: il salvataggio scrive **sempre e solo dentro il DNG
-stesso** (namespace XMP `crs`, lo stesso che usa Adobe) — nessun sidecar esterno.
+**Perché**: un'alternativa a costo zero all'abbonamento Lightroom, non un'alternativa ad Adobe come
+tecnologia. DNGForge scrive le modifiche nei veri tag XMP `crs` di Adobe (Adobe DNG Converter è
+gratuito, a differenza di Lightroom) — un file elaborato qui, aperto in un vero Lightroom, si
+ritrova praticamente identico e ancora pienamente editabile, e viceversa. Nessun sidecar esterno:
+il salvataggio scrive **sempre e solo dentro il DNG stesso**, requisito di progetto non
+negoziabile.
 
 ## Come funziona
 
