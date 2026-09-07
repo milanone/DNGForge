@@ -1,0 +1,7 @@
+rawpy
+PySide6
+numpy
+PyExifTool
+Pillow
+opencv-python
+lensfunpy
