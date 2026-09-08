@@ -6,3 +6,4 @@ __pycache__/
 *.jpg
 *.jpeg
 reference/RethinkRAW/
+dng_converter_gui.cfg.json

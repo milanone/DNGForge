@@ -50,8 +50,34 @@ The (optional) argument loads a DNG on startup.
 - Copy/paste settings between photos
 - RGB histogram
 
+## Batch RAW converter (`dng_converter_gui.pyw`)
+
+A separate, standalone GUI for batch-converting a folder of NEF/DNG files — the step that
+typically comes *before* editing in DNGForge itself (e.g. converting a card full of NEFs to DNG,
+or producing delivery JPEGs from already-edited DNGs). Not integrated into `DNGForge.pyw`'s own
+window; run independently.
+
+Output options:
+- **JPG** — extracts the embedded preview (via `exiftool`) and optionally resizes/recompresses it
+  with Pillow; at original resolution, extraction can be lossless (no recompression at all)
+- **DNG lossy** / **DNG lossless** — via Adobe DNG Converter
+
+Resolution is a cap, never an upscale: original, a target megapixel count, 4K (3840px long edge),
+or 2048px. JPEG quality is editable (default 69). Optionally sets each output file's
+modification date from its EXIF shooting date, so converted files keep sorting correctly in a
+file browser. Detects Adobe DNG Converter and `exiftool` automatically and shows which required
+tools are missing. Preferences (format/resolution/quality) persist between runs in
+`dng_converter_gui.cfg.json` (not tracked in the repo).
+
+Run with:
+
+```
+pythonw dng_converter_gui.pyw
+```
+
 ## Structure
 
 - `DNGForge.pyw` — main application (a single `DNGForge(QMainWindow)` class)
+- `dng_converter_gui.pyw` — standalone batch NEF/DNG → JPG/DNG converter, see above
 - `backups/` — significant earlier versions, kept for reference
 - `reference/` — third-party code consulted as reference (not included in the repo)
