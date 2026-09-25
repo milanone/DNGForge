@@ -946,12 +946,96 @@ does its own colorimetric WB regardless of whether this app's own display estima
 path)`; the status bar reports which path is active ("colorimetria DNG attiva" vs "colorimetria
 approssimata") so the *display* is never silently wrong, even though it no longer affects what
 gets rendered.
-- **Tone**: `tone_mode` combobox — **Auto** writes `-XMP-crs:AutoTone=True` and disables the six
-  sliders, letting Adobe DNG Converter compute its own auto-tone (this app no longer estimates
-  anything itself for Auto — see below); **Default** resets them to 0; **Custom** is entered
-  automatically when a slider is nudged away from Default (`_on_tone_slider_changed()`). Every
-  slider just writes its own `-XMP-crs:*` tag (`Exposure2012`/`Contrast2012`/`Highlights2012`/
-  `Shadows2012`/`Whites2012`/`Blacks2012`) — Adobe DNG Converter does the actual rendering.
+- **Basic Corrections** (`Exposure`/`Contrast`, -5..5 EV / -100..100): split out of the Tone
+  panel into its own group box, user-requested — Exposure/Contrast are whole-image adjustments
+  meant to be set once and kept, independent of Tone's own Auto/Default/Eye Perception/Custom
+  recipe-cycling ("il tone 'default' non deve toccare i valori di exposure e contrast"). Their
+  `on_change` is a plain `_schedule_update()`, not `_on_tone_slider_changed()` — nudging them no
+  longer flips `tone_mode` to "Custom", since they're no longer part of what that combo tracks.
+  Still disabled together with the four Tone sliders while Tone Mode is Auto
+  (`_set_tone_controls_enabled()`, unchanged) — `AutoTone` is a single XMP concept covering the
+  whole basic recipe (Adobe computes `Exposure2012`/`Contrast2012` too, not just
+  Highlights/Shadows/Whites/Blacks), a tag-level fact the UI split doesn't change. Exposure's
+  own range was widened from ±3 to **±5 EV** the same session, matching real Lightroom's own
+  range — confirmed against exiftool's `XMP.pm` source that `Exposure2012` itself has no
+  min/max at all (`Writable => 'real'`), so ±3 was purely a DNGForge UI choice, not a format
+  constraint.
+- **Tone**: `tone_mode` combobox — **Auto** writes `-XMP-crs:AutoTone=True` and disables the four
+  remaining sliders (Highlights/Shadows/Whites/Blacks — Exposure/Contrast moved to Basic
+  Corrections above, but are still covered by this same Auto-disable, see that section), letting
+  Adobe DNG Converter compute its own auto-tone (this app no longer estimates anything itself for
+  Auto — see below); **Default** resets those same four to 0, deliberately leaving Exposure/
+  Contrast untouched now, and *also* clears `HSL Saturation Red`/`HSL Saturation Orange`/
+  `HSL Luminance Red` back to 0 — the three HSL corrections **Eye Perception** sets (see below)
+  to compensate for its own Presence boost, which mean nothing once that boost is gone and would
+  otherwise sit stranded after switching from Eye Perception back to Default, the same "always
+  write/reset the off-state too" convention already used throughout this app (`HasCrop`,
+  `WhiteBalance`, Black & White, ...); **Custom** is entered automatically when one of the four
+  tone sliders is nudged away from Default (`_on_tone_slider_changed()`). Every slider just
+  writes its own `-XMP-crs:*` tag
+  (`Exposure2012`/`Contrast2012`/`Highlights2012`/`Shadows2012`/`Whites2012`/`Blacks2012`) —
+  Adobe DNG Converter does the actual rendering. A fourth mode, **Eye Perception**
+  (`_on_tone_mode_changed()`; named "Vivace" until the user
+  renamed it once its full intent was spelled out, see below), is a one-click preset — not part
+  of real Lightroom's own Tone Mode set, this app's own addition — with a deliberate,
+  non-obvious design intent spanning three different panels at once, not just Tone.
+
+  **Not a bug — a deliberate perceptual/local-tone-mapping choice, confirmed with the user
+  directly after an earlier session wrongly "fixed" it as one.** A first look at the Tone half of
+  this preset (`Highlights=-50`/`Shadows=+50`/`Whites=-50`/`Blacks=+50` — highlights pulled down,
+  shadows lifted) — comparing its sign to what a plain global-contrast boost would use — mistook
+  the flattened global-contrast *result* for the actual goal and inverted all four values; the
+  user corrected this immediately ("no, erano giusti come erano prima... il risultato è
+  orrendo"). The real intent: compress the *global* tonal range the way the human eye/brain
+  constantly does perceptually (local adaptation lifting shadow detail and rolling off
+  highlights, closer to how a scene actually *looks* to a viewer standing there than a literal
+  linear/global-contrast capture — grounded in real vision science, Retinex theory specifically,
+  and the same principle behind local-tone-mapping HDR algorithms and phone-camera computational
+  photography). A global pixel-std-dev measurement (the metric the earlier, wrong "fix" used to
+  declare this flattened look a bug) cannot distinguish "more global contrast" from "correctly
+  compressed base awaiting local-contrast punch" — it will always read the intended design as a
+  regression. **Lesson for future changes to this preset**: its "correctness" is this creative
+  intent, not a literal reading of Lightroom's own per-slider sign conventions — confirm the
+  intended look with the user before treating an unexpected sign as a bug, the same way any other
+  stylistic tuning (curve shape, profile Look, grain amount) in this app is never "fixed" without
+  checking first.
+
+  **Extended to Presence and HSL, user-requested, once the full design was spelled out in
+  conversation**: the "punch back locally" half of the design (mentioned above only as something
+  the user did manually afterward) is now baked into the same one-click preset —
+  `Texture`/`Clarity2012`/`Dehaze`/`Vibrance`/`Saturation` all set to **+10** (adds back local
+  contrast/presence the Tone-panel compression gave up, the same "flatten globally, punch back
+  locally" pairing behind real local-tone-mapping algorithms). Also folds in a fix for a specific
+  side effect the user found through actual use: reds are typically the first channel to clip
+  when Presence is pushed (least headroom in most camera color science — the reason Lightroom's
+  own Vibrance, unlike plain Saturation, already protects skin tones specifically), so
+  `HSL Saturation Red` and `HSL Luminance Red` are both set to **-10** as a targeted correction,
+  rather than pulling back Vibrance/Saturation globally and losing punch everywhere else too.
+  A second HSL correction, added the same way once the user hit it in practice: `HSL Saturation
+  Orange` set to **-20** — orange carries skin tones, and pushed Vibrance/Saturation without this
+  correction reliably turns skin an unnatural orange/"carrot" tone, "quasi sempre" per the user's
+  own observation, the same failure mode as Red's clipping but a different channel and (per the
+  user) a near-universal need rather than an occasional one.
+  A third recovery channel, also user-requested: **Curve** is set to `curve_combo` = **"Strong
+  Contrast"** (see "CONFIRMED BUGS, fixed: Curve and Profile" above for how this preset actually
+  writes a real point list, not just a name) — an S-curve adds contrast specifically in the
+  midtones, complementing Presence's local-detail/haze contrast and the HSL correction's color
+  fix with a third, distinct kind of "vivacity" recovery. Selecting Eye Perception now sets 13
+  fields across 4 different panels (Tone, Presence, HSL, Curve) in one click — genuinely
+  cross-cutting the `tone_mode` combo's own nominal "Tone panel" scope, a deliberate consequence
+  of the user's own request ("così la combinazione... fa tutto in un colpo solo"), not an
+  accidental scope creep. **Verified**: a real `DNGForge` instance (`QT_QPA_PLATFORM=offscreen`),
+  selecting Eye Perception, confirmed all 13 fields land on their expected values in one call
+  (HSL Saturation Orange = -20 confirmed alongside the rest), including `curve_combo` showing
+  "Strong Contrast" with the curve editor correctly hidden (not "Custom"). Note: nudging a
+  Presence or HSL slider afterward does **not**
+  flip `tone_mode` back to Custom (only the six Tone-panel sliders' own `_on_tone_slider_changed()`
+  does that) — an existing, unchanged architectural boundary (Presence/HSL were never wired to
+  `tone_mode`'s dirty-tracking even before this preset started touching them), not a new gap
+  introduced here; and selecting **Default** still only resets the six Tone sliders, not
+  Presence/HSL — deliberately left alone rather than silently wiping a user's independent
+  Presence/HSL edits, so the two directions of this preset (apply vs. reset) are not fully
+  symmetric on purpose.
 
 **History — this used to be the least successful part of the app**, worth knowing about even
 though the code is gone: an earlier Python/LAB-channel approximation of Contrast/Highlights/
@@ -2094,6 +2178,165 @@ this DNG's structure has no IFD1 chain and exiftool's write silently no-ops rath
 one — not viable on this file structure, abandoned once `JpgFromRaw` turned out to be the real
 answer anyway.
 
+### CONFIRMED BUG, fixed: the `-JpgFromRaw<=` fix above quietly tripled the file's preview bloat (`_prepare_save_preview_jpegs()`)
+
+**Reported by the user as a slow, oddly large save**: "ci ha messo 32 secondi per il render a piena
+risoluzione" on a 24MP file, followed by "il file è cresciuto a 35 mb, secondo me sta salvando più
+copie della foto nel dng." Investigated the timing claim first and mostly ruled the app out: a real
+save of a comparable 24MP file (`DSC_6751_prova.dng`) on this dev machine, same `I:\` Google Drive
+path, consistently landed at 9-13s across several scenarios (plain edit, the heavy "Eye Perception"
+preset, lens correction on/off, Save while the live-preview pipeline was still mid-render) — never
+close to 32s. The actual explanation turned out to be unrelated to this app entirely: the user was
+editing directly off an SD card, not the Google Drive path, that session — a much slower write
+medium, especially for `-overwrite_original`'s read-whole-file/write-new-file/rename pattern.
+
+**The file-size claim, however, was real and worth root-causing on its own.** A direct
+`exiftool -a -G1` dump of the user's own file (`DSC_6795.dng`, 24MP, 37.1MB) found **four separate
+copies of the identical ~7,039,901-byte JPEG**, at four different file offsets:
+`IFD0.PreviewImage`, `SubIFD1.PreviewImage`, `PreviewIFD.PreviewImage` (the legacy EXIF-thumbnail
+IFD chain), and `SubIFD2.JpgFromRaw` — despite the first three declaring much smaller
+`ImageWidth`/`ImageHeight` (5339×3559, 1024×683, and no dimensions at all, respectively) than the
+6000×4000 content actually embedded in them. ~28MB of the file's 37MB was pure redundancy: the same
+full-resolution image stored four times over.
+
+**Root cause**: `-PreviewImage<=` is a single exiftool directive, but "PreviewImage" is a tag name
+that physically exists in *three* separate places in this DNG structure (`IFD0`/`SubIFD1`/
+`PreviewIFD` — small/medium-preview slots inherited from Adobe DNG Converter's own initial
+NEF→DNG conversion) — one write updates all three, with the exact same bytes. `save_to_dng()` was
+feeding it the *same full-resolution file* already going to `-JpgFromRaw<=` (see the FastStone fix
+just above) — a leftover from before that fix existed, when `-PreviewImage<=` was the *only*
+preview directive and had to be full resolution for the app's own edits to show up anywhere at all.
+Once `-JpgFromRaw<=` was added specifically to fix FastStone (which reads that tag, not
+`PreviewImage`), `-PreviewImage<=` never needed to carry full resolution *at all* — but nothing
+had gone back to shrink it, so three legacy small-preview slots kept silently inflating to full
+size on every single save, file after file, this whole time.
+
+**Fix**: `_prepare_save_preview_jpegs()` — called once per save, right after the full-resolution
+render is in hand (either plain or local-adjustment-composited, and after lens correction if
+active) — does two things purely to the *already-rendered* JPEG bytes (a compression/resize
+post-process, not a second Adobe rendering pass, so this doesn't touch "Adobe DNG Converter is the
+sole renderer"): (1) re-encodes the full-resolution copy at `SAVE_PREVIEW_QUALITY` (69 — this
+app's own historical Save quality from before the Adobe-only migration, see "Preserving file
+timestamps" above, user-requested to bring it back now that there's a real re-encode step again),
+and (2) produces a genuinely small thumbnail capped at `SAVE_THUMB_MAX_SIDE` (1024px long edge,
+matching what `SubIFD1` itself already historically claimed). `-JpgFromRaw<=` gets the
+re-encoded full-resolution file; `-PreviewImage<=` gets the small thumbnail instead — so the one
+directive that fans out to three legacy slots now fans out a small file to all three, not a large
+one.
+
+**Verified end-to-end** on the user's own real file (`DSC_6795.dng`, a disposable copy, not the
+original): saved through a real `DNGForge` instance — file size dropped from 37.14MB to **12.21MB**;
+`exiftool -a -G1` confirmed `IFD0`/`SubIFD1`/`PreviewIFD`'s `PreviewImage` all now hold the same
+133,520-byte thumbnail (down from 7,039,901 bytes each) while `SubIFD2.JpgFromRaw` holds a
+2,828,792-byte full-resolution copy (down from 7,039,901 bytes too, purely from the quality-69
+re-encode — same resolution, much lighter compression than whatever Adobe's own converter used);
+both extracted and decoded correctly via PIL (thumbnail 1024×683, full-res 5339×3559, matching
+mean brightness to within 0.03 — confirming both are genuinely the same edited content, not a
+mismatch). Also confirmed file size does **not** keep growing across repeated saves of the same
+file (a separate, legitimate hypothesis raised before the four-copies structure was found) — three
+consecutive saves of an already-bloated copy landed at 38.36/38.66/38.92MB, normal JPEG-encoding
+variance between saves, not accumulation.
+
+### Save/Export still felt slow after the bloat fix — `save_to_dng()`/`export_preview_jpeg()` weren't reusing the persistent exiftool process
+
+**User pushback, correctly**: after the preview-bloat fix above, a real save on the user's own file
+still took ~10s and the user flagged it directly ("comunque troppi"). Instrumented every step of
+`save_to_dng()` with real timing (monkey-patching `shutil.copyfile`/`subprocess.run`/
+`exiftool.ExifToolHelper.execute` around a real save, not guessing) on `DSC_6795.dng`:
+
+| Step | Time |
+|---|---|
+| copy original → scratch | 0.05s |
+| write XMP tags onto scratch copy (exiftool) | 0.77s (+ 0.29s process-startup handshake) |
+| Adobe DNG Converter, full-resolution render | 3.68s |
+| extract rendered preview JPEG (exiftool `-b`) | 0.63s |
+| lens correction (decode/remap/re-encode) | 1.21s |
+| `_prepare_save_preview_jpegs()` (quality-69 re-encode + thumbnail) | 0.42s |
+| write final tags + preview back to the original (exiftool) | 1.53s (+ 0.29s process-startup handshake) |
+| **TOTAL** | **~9.4s** |
+
+**Adobe DNG Converter's own full-resolution render (3.68s) is the single largest cost and isn't
+something to chase further** — that's real RAW demosaic + the full develop recipe (tone, presence,
+detail, HSL, etc.) at full sensor resolution, the actual rendering work this app exists to trigger,
+not overhead. **The two ~0.29s process-startup handshakes, however, were pure waste**: `save_to_dng()`
+(and `export_preview_jpeg()`, found to have the exact same pattern) opened a *fresh*
+`with exiftool.ExifToolHelper(...) as et:` block for each of its two writes — spawning and tearing
+down a brand-new Perl-interpreter process twice per save, even though this project already solved
+this *exact* problem for the render pipeline: `_persistent_exiftool_execute()` (see its own
+docstring, written when the live-preview pipeline had the identical per-call spawn cost) keeps one
+shared exiftool process alive for the app's lifetime instead. `save_to_dng()`/`export_preview_jpeg()`
+simply hadn't been switched over when that fix was originally made — both now route their writes
+through the same shared process. **Verified**: a real save on `DSC_6795.dng`, same machine, same
+file, dropped from ~9.4s to **~7.0s** (both a first save and a follow-up save on the same session
+timed within noise of each other, confirming the shared process is genuinely being reused, not
+just faster by chance).
+
+**Not pursued further, since it would trade image quality for speed rather than removing pure
+overhead**: lens correction's own 1.21s is dominated by `cv2.remap(..., cv2.INTER_LANCZOS4)` (see
+"Lens Corrections: local `lensfunpy`-based rendering" above) — a directly-benchmarked ~2-3×
+slower-but-higher-quality choice than `cv2.INTER_CUBIC` at this resolution. Left as-is; if save
+speed ever needs to be cut further, this is the next lever, but it's a real quality/speed
+trade-off the user should decide on, not a free optimization like the one above.
+
+### Embedded JpgFromRaw capped at 12MP, crop-aware (`_compute_save_render_side()`)
+
+**User-requested, right after the timing/bloat investigation above**: even a *correctly-sized*
+single full-resolution embed (the fix two sections up) was still 24MP+ on a modern sensor —
+"anche troppi" for what's meant to be a preview, not the actual working data (the DNG's own raw
+`SubIFD` stays completely untouched, full native resolution, for exactly this reason — Export
+Preview as JPEG can always re-render at full resolution later, see that method, unchanged).
+
+**The crop-aware requirement is the interesting part, not just "always request a smaller `-side`
+flag"**: the user's own framing was to use the sensor's full resolution *for cropping headroom*
+— "sfruttiamo i 24 mp per fare dei bei crop ma se l'immagine è a tutto fotogramma 12 mp bastano."
+So a crop should still reach the `SAVE_JPGFROMRAW_TARGET_MP` target (12) if the *cropped region's
+own native pixel count* supports it, not fall to some smaller size just because a crop is active
+— but a crop tight enough that its native resolution is already below the target must never be
+upscaled to force it there ("se il ritaglio è tale che la foto non può essere 12 mp non fare
+upscaling, lascia la risoluzione che viene") — confirmed explicitly before implementing, not
+assumed either way, since the two readings genuinely diverge for a tight crop and this project's
+own established convention (zoom-detail rendering, see that section) is specifically to never
+invent detail beyond the sensor.
+
+**`_compute_save_render_side()`** computes the `-side` value to hand Adobe DNG Converter (or
+`None`, meaning "render at native resolution, no flag at all") so the **post-crop** output lands
+at the target. The one subtlety, already established by the "Zoom detail rendering" investigation
+above: Adobe DNG Converter applies crop tags *after* scaling to the requested `-side` — that's
+*why* the zoom-detail pipeline renders the whole effective frame at a large `-side` rather than
+asking Adobe to crop-and-scale directly to a small target (a small `-side` there was found to
+silently degrade to a much-smaller fallback preview tier, see that section) — so hitting a
+post-crop pixel target means requesting a *larger* full-frame `-side`, scaled up by
+`sqrt(target_mp / native_crop_mp)`. When the crop's own native resolution is already at or below
+the target, the function returns `None` outright — same graceful "just use what's actually there"
+behavior, no separate upscale-then-downscale round trip needed. Rotation is out of scope (falls
+back to `None`, i.e. native resolution) for the same reason `_region_within_effective_crop()`/
+`_local_filters_for_render()` already skip rotated crops elsewhere — a rotated sub-rectangle's
+true post-rotation area isn't simply width-fraction × height-fraction.
+
+Wired into both `save_to_dng()` render paths: the plain Adobe DNG Converter call gets `-side
+<value>` appended when not `None`; the local-adjustments compositing path
+(`_render_local_adjustments_composite()`) already accepted a `side` parameter (used elsewhere for
+zoom-detail) and applies it uniformly to the base render *and* every per-region render — verified
+in the source that a single shared `render_one()` closure is what every task (base + each active
+region) actually calls, so all of a save's sub-renders land in the same pixel space regardless of
+how many local-adjustment regions are active.
+
+**Verified** (`QT_QPA_PLATFORM=offscreen`, a real `DNGForge` instance, real Adobe DNG Converter
+renders, `DSC_6751_prova.dng`, 6000×4000/24MP native — with `crop`/`radial_filters`/
+`gradient_filters`/`spots` explicitly reset per case rather than trusting the file's own
+pre-existing saved state, which turned out to already carry a real crop+gradient filter from
+earlier project history and initially produced a confusing, seemingly-nondeterministic result
+before that was accounted for): **no crop** → `_compute_save_render_side()` returns 4243
+(deterministic across repeated calls), saved `JpgFromRaw` decodes to exactly 4243×2829 = 12.00MP;
+**~50%-area crop** (native resolution = 12MP exactly at that crop) → returns `None`, saved
+`JpgFromRaw` decodes to the *same* 4243×2829 = 12.00MP, reached naturally at native resolution
+with no `-side` needed; **tight crop** (4% area, 0.96MP native) → returns `None`, saved
+`JpgFromRaw` decodes to exactly 1200×800 = 0.96MP — confirmed *not* upscaled to 12MP, honoring the
+user's explicit "no upscaling" direction. Save times also dropped further as a direct consequence
+(fewer pixels for every downstream step — Adobe's own conversion, lens correction, JPEG
+encode/decode): 2.85-4.08s across the three cases above, down from the already-improved ~7-10s
+this same file needed before this cap existed.
+
 ### Reloading edit state on open (`read_xmp_crs_state()`, `_apply_xmp_crs_state()`)
 
 Until this pass, `load_dng()` always called `reset_controls()` unconditionally — every control
@@ -2828,6 +3071,134 @@ shows a proper varied mountain-shape, not a flat block; pushing Exposure to +2.0
 (highlights/clipping) edge in a second screenshot, confirming the widget tracks real edits
 through the real render pipeline, not a static/cached image; `close_photo()` correctly resets
 it to the "Istogramma non disponibile" placeholder state.
+
+### Default Preview toggle (`_toggle_default_preview()`, `_start_default_preview_render()`)
+
+User-requested (zoom toolbar, "👁 Default" button next to the ⓘ XMP/EXIF/Metadata buttons,
+on/off toggle logic): a quick way to compare the current edit against "the image as it looked
+when generated at the start" — every control at `reset_controls()`'s own default (see "Virgin-
+file defaults match Lightroom, not zero"), with the current crop/rotation kept exactly as-is
+(explicitly requested — crop/straighten is a framing decision, not a "look" decision, so it
+should survive the comparison).
+
+**A pure display swap, nothing else.** Never touches the real widget state, `self.crop`,
+undo/redo history, or the file on disk — `_update_image_label()` just picks
+`self._default_preview_pixmap` instead of `self._preview_pixmap` while the toggle is active
+(see that method), and the always-running live-edit pipeline keeps rendering into
+`self._preview_pixmap` in the background completely unaware the toggle even exists — switching
+back off shows current, up-to-date real pixels immediately, no re-render needed.
+
+**Building the "default" XMP args reuses `reset_controls()` itself, not a second hardcoded copy
+of what "default" means** — `_toggle_default_preview()` captures the real state
+(`_capture_edit_state()`), calls `reset_controls()`, overrides just `self.crop` back to the real
+value, builds `_build_all_edit_xmp_args(for_save=True)` (the real committed crop regardless of
+whether the guide happens to be showing), then immediately calls `_apply_edit_state(real_state)`
+to restore every widget. The whole sequence is synchronous with no Qt event-loop yield in
+between, so nothing ever actually repaints mid-swap — sliders never visibly flicker. Reusing
+`reset_controls()` this way means this toggle can never drift out of sync with the project's own
+single source of truth for "default" — the alternative (hardcoding the same 30+ default values a
+second time here) is exactly the anti-pattern "Virgin-file defaults match Lightroom, not zero"
+already warns against for other code.
+
+**Renders through a disposable copy of `work.dng`, never `work.dng` itself** — the always-running
+live pipeline can be writing its own XMP tags onto `self._work_dng_path` at the same moment via
+`-overwrite_original`; writing this toggle's own tags onto the same shared file concurrently
+would be a real race (whichever exiftool call finishes last wins, on both threads' converted
+output). `_start_default_preview_render()` copies it to a fresh `default_preview_<token>.dng`
+per render and runs a plain `DngConverterRenderThread` against that copy — local adjustments
+never need considering here, since `reset_controls()` always clears `radial_filters`/
+`gradient_filters`/`spots` to empty. The copy's path is tracked in `_default_preview_src_paths`,
+a dict keyed by generation (not a single shared attribute) — the exact same reason
+`_thumbnail_scan_dirs` (see "Gallery filmstrip") uses a dict: a shared attribute would let a
+second toggle-on, started before the first one's cleanup runs, delete the *new* render's own
+input file instead of its own.
+
+**Zoom-detail patch is skipped while showing the default preview** (`_update_image_label()`) —
+that patch is always a real render of the *current* edit state (see "Zoom detail rendering"), so
+compositing it on top of a default-state background would paste real edited pixels into a
+"before" view, a real mismatch rather than a faithful comparison. The base (work-copy-resolution)
+default render still displays correctly at any zoom level, just without the higher-resolution
+zoom-detail patch layered on top.
+
+**Per-file, like the other two render pipelines**: `_reset_dngconv_pipeline()`/`close_photo()`
+both clear `_default_preview_active`/`_default_preview_pixmap` and bump
+`_default_preview_generation` (invalidating any stale in-flight render from the previous file,
+same pattern as the main/zoom-detail pipelines) and uncheck the button — a file switch always
+starts with the toggle off, never showing a stale pixmap from a different photo.
+
+**Verified** (`QT_QPA_PLATFORM=offscreen`, a real `DNGForge` instance, real Adobe DNG Converter
+renders throughout, disposable copy of `RAW_NIKON_D90.dng`): pushed Exposure to +2.5 and set a
+crop (0.1-0.7 both axes, a 0.6 fraction), toggled Default Preview on — the rendered default
+pixmap came back at exactly 0.6× the work-copy's full-frame dimensions (1152×765 vs. 1920×1275),
+confirming the real crop was correctly applied to an otherwise-default render; `exposure_slider`
+still read 2.5 and `self.crop` was still the real dict throughout, confirming no widget/state
+mutation leaked out of the toggle; switching off restored the exact same (object-identity-equal)
+real preview pixmap instantly.
+
+### Session edit cache (`load_dng()`, `self._session_edit_cache`)
+
+User-requested, flagged as specifically important for folder workflows: "quando lavoro con una
+cartella di file... quando passo da una foto all'altra senza aver salvato non perdo gli
+aggiustamenti fatti." Before this, switching photos via the gallery filmstrip (or File → Open
+DNG…) silently discarded any unsaved edit on the photo being left, with no warning at all —
+unlike closing the app or the current photo (`closeEvent()`/`close_photo()`), which both prompt.
+Working through many files in a folder without saving every single one before moving to the next
+made this a real, likely, and costly way to lose work.
+
+**In-memory only, not written to disk, on purpose** — `self._session_edit_cache` is a plain dict,
+`path -> _capture_edit_state()` snapshot, following the exact same "usa e getta" convention
+already established for the gallery filmstrip and Copy/Paste Settings
+(`self._settings_clipboard`) in this app: nothing here needs to survive an app crash or restart,
+only switching between photos within one running session. A disk-backed version would need a
+second, separate feature (loading it back and offering recovery on next launch) that nobody
+asked for — this stays deliberately scoped to what was actually requested.
+
+**Mechanics**: `load_dng(path)` captures the *outgoing* file's current state into the cache,
+keyed by its own path, right at the top — before touching `self.raw`/`self.raw_path` — but only
+when the incoming `path` actually differs from `self.raw_path` (a same-path reload, e.g.
+`revert_to_saved()` calling `load_dng(self.raw_path)` again, must NOT re-cache the very state
+about to be discarded). After the normal XMP-based restore completes and `self._saved_edit_state`
+is captured (the dirty-check baseline, deliberately captured *before* this step so a file
+reopened with session-cached unsaved edits still correctly shows as dirty), `load_dng()` checks
+whether the *incoming* path has a cache entry and, if so, applies it via `_apply_edit_state()` —
+overriding whatever was just restored from the file's own saved XMP (or `reset_controls()`
+defaults) with whatever was on screen for this same file earlier in the session. The status bar
+appends "modifiche non salvate di questa sessione ripristinate" when this happens, so it's never
+silently unclear why the sliders don't match the file's own saved state.
+
+**Three places must invalidate a stale entry, not just write new ones** — found by reasoning
+through the interaction with the app's *existing* discard/save paths before shipping, the same
+"work through the edge cases before they're reported" discipline already applied elsewhere in
+this file (e.g. the gallery filmstrip's own per-generation scratch-dir dict):
+- **`revert_to_saved()`** explicitly discards in-memory edits and reloads from disk — it pops its
+  own path's cache entry *before* calling `load_dng()`, since `load_dng()`'s own same-path-reload
+  skip only prevents re-caching, it doesn't know a revert (as opposed to some other same-path
+  reload) is what's happening. Without this, "Revert to Last Save" would silently do nothing —
+  the cache would just hand the discarded state right back.
+- **`close_photo()`** pops the cache entry once past its own Save/Discard/Cancel prompt
+  (Cancel returns early, so the pop only runs once the user actually committed to closing) —
+  covers the Discard case specifically (leaving a discarded edit cached would resurrect it if the
+  same file is ever reopened later this session) and is a harmless no-op in the Save case, since
+  `save_to_dng()` (see below) already cleared it by then.
+- **`save_to_dng()`**, on a successful save, pops the cache entry for the file just saved — the
+  single choke point every save path (toolbar Save, Ctrl+S, closeEvent()'s Save button,
+  close_photo()'s Save button) already funnels through. Necessary because "cached unsaved state"
+  and "what's now on disk" are identical the instant a save succeeds, so the cache has nothing
+  left to usefully contribute — and leaving the *old*, pre-save snapshot behind would resurface
+  stale (already-saved-over) edits if the same file is reloaded again later (e.g. re-clicking its
+  own already-open thumbnail in the filmstrip, which emits `photoActivated` unconditionally, with
+  no guard against re-selecting the currently-active photo).
+
+**Verified end-to-end** (`QT_QPA_PLATFORM=offscreen`, a real `DNGForge` instance, real Adobe DNG
+Converter renders throughout, disposable copies of `RAW_NIKON_D90.dng`/`RAW_LEICA_M8.DNG`): set
+Exposure=1.8 on photo A (no save), switched to photo B (opened cleanly at Exposure=0, confirming
+no cross-photo leakage), switched back to A (Exposure correctly restored to 1.8 with no save
+having ever happened); set Exposure=2.9 on A and reverted (correctly dropped to the saved
+baseline of 0.0, and the cache entry for A was confirmed gone afterward — revert isn't undone by
+the cache); set Exposure=1.2 on A, switched away and back (correctly restored via the cache),
+then saved — confirmed the cache entry was gone immediately after the save, and reloading the
+*same* path again afterward correctly showed 1.2 sourced from the file's real, freshly-saved XMP,
+not a stale pre-save cache entry.
 
 ## Reference material
 

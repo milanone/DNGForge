@@ -40,15 +40,34 @@ The (optional) argument loads a DNG on startup.
 ## Main features
 
 - White balance: color picker on the raw sensor data, presets, colorimetric temperature/tint
+- Basic corrections (exposure, contrast) and tone (highlights/shadows/whites/blacks) as
+  independent panels — a Reset in one never touches the other
+- "Eye Perception" one-click tone preset: perceptual dynamic-range compression paired with
+  local contrast, a midtone curve and a targeted skin-tone correction, tuned for a natural
+  (not flat) look straight out of the camera
 - Custom tone curve, saturation, sharpness
 - Radial and graduated filters, multi-region, with Lightroom/ACR-compatible XMP persistence
 - Spot removal
 - Lens correction (via `lensfunpy`)
 - Crop and straighten
+- Default-preview toggle to compare the current edit against the untouched starting point
 - Undo/redo (20-state stack) + revert to last save
+- Per-session edit cache: switching between photos while working through a folder never
+  loses unsaved adjustments, even without saving each one first
 - EXIF metadata panel, filmstrip gallery to browse a folder
 - Copy/paste settings between photos
 - RGB histogram
+
+## Save output
+
+The embedded preview is capped at 12 megapixels by default — large enough for full-screen
+viewing and most prints, and crop-aware (a crop keeps native resolution up to that cap rather
+than being additionally downscaled, but is never upscaled past what the sensor actually
+captured). The original raw data inside the DNG is never touched or re-rendered by this cap;
+Export Preview as JPEG always renders at full resolution regardless. Saving reuses a single
+background `exiftool` process instead of spawning one per write, and writes exactly one
+full-resolution embedded copy plus small thumbnails instead of duplicating the full-resolution
+preview into every legacy preview slot a DNG can have.
 
 ## Batch RAW converter (`dng_converter_gui.pyw`)
 

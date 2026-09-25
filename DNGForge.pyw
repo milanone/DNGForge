@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QVBoxLayout,
     QHBoxLayout, QPushButton, QFileDialog, QGroupBox,
     QComboBox, QSplitter, QScrollArea, QSizePolicy, QMessageBox, QCheckBox,
-    QRubberBand, QDialog, QPlainTextEdit, QLineEdit, QToolButton,
+    QRubberBand, QDialog, QPlainTextEdit, QLineEdit, QToolButton, QFrame,
 )
 from PySide6.QtGui import (
     QPixmap, QAction, QPainter, QPen, QColor, QFont, QDoubleValidator, QIntValidator, QIcon,
@@ -2585,6 +2585,73 @@ def _apply_lensfun_correction(jpeg_path: str, lens_correction: "dict | None") ->
         pass
 
 
+SAVE_PREVIEW_QUALITY = 69  # user-requested quality for the DNG's own embedded previews —
+# matches this app's own pre-Adobe-only local pipeline's historical Save quality (see
+# CLAUDE.md, "Preserving file timestamps": "previously quality 69" for Save's embedded
+# preview, before rendering moved to Adobe DNG Converter and there was no local re-encode
+# step left to pick a quality for). Only used by save_to_dng() — export_preview_jpeg()
+# still embeds Adobe's own bytes completely as-is, unchanged, since that's a standalone
+# file the user may want at full quality.
+SAVE_THUMB_MAX_SIDE = 1024  # long-edge cap for the small IFD0/SubIFD1/PreviewIFD preview —
+# see _prepare_save_preview_jpegs()'s own docstring for why this needs to be genuinely
+# small rather than a second full-resolution copy.
+
+SAVE_JPGFROMRAW_TARGET_MP = 12  # user-requested cap for the *full-resolution* JpgFromRaw
+# embed itself — a 24MP+ sensor's own native resolution was "anche troppi" for an embedded
+# preview. See DNGForge._compute_save_render_side() for how this is achieved even with an
+# active crop (the cropped *output* should still reach this target, not the uncropped
+# frame) — and, symmetrically, why a small enough crop is never upscaled past its own real
+# native resolution to force it, per the user's own explicit direction ("se il ritaglio è
+# tale che la foto non può essere 12 mp non fare upscaling, lascia la risoluzione che
+# viene").
+
+
+def _prepare_save_preview_jpegs(jpeg_path: str, out_dir: str):
+    """save_to_dng()-only post-process of the already-rendered full-resolution JPEG: (1)
+    re-encodes it in place at SAVE_PREVIEW_QUALITY (this app's own historical Save quality,
+    see that constant), and (2) produces a genuinely small thumbnail (long edge capped at
+    SAVE_THUMB_MAX_SIDE) at a new path. Returns (full_res_path, thumb_path) — the caller
+    feeds the first to -JpgFromRaw<= and the second to -PreviewImage<=, instead of the same
+    full-resolution file to both.
+
+    Purely a JPEG re-compression/resize of pixels Adobe DNG Converter already rendered —
+    not a second rendering pass, so this doesn't conflict with "Adobe DNG Converter is the
+    sole renderer" (CLAUDE.md) any more than _apply_lensfun_correction()'s own decode/
+    re-encode round-trip already doesn't.
+
+    **Why this exists**: exiftool's `-PreviewImage<=` writes into *every* physical location
+    the (single, logical) "PreviewImage" tag occurs in this DNG structure — IFD0, SubIFD1,
+    and the legacy PreviewIFD chain, three separate small/medium-preview slots inherited
+    from Adobe DNG Converter's own initial NEF→DNG conversion — all with the *same* bytes
+    handed to that one directive. Historically this app fed it the exact same full-
+    resolution image already going to -JpgFromRaw<= (see save_to_dng()'s own comment on
+    that line, "CONFIRMED BUG, fixed: a saved edit didn't show up in FastStone" — the fix
+    that introduced -JpgFromRaw<= never needed -PreviewImage<= to also carry full
+    resolution, only JpgFromRaw does, for LibRaw-based viewers specifically) — bloating
+    three small-preview slots up to full size each. **Confirmed on a real user file**
+    (`DSC_6795.dng`, 24MP): four separate ~7,039,901-byte copies of the identical image
+    (IFD0.PreviewImage, SubIFD1.PreviewImage, PreviewIFD.PreviewImage, SubIFD2.JpgFromRaw),
+    ~28MB of pure redundancy in a 37MB file, confirmed via `exiftool -a -G1` showing all
+    four at the identical byte length despite very different *declared* ImageWidth/Height
+    (5339×3559, 1024×683, unlabeled, 6000×4000 respectively) — the declared dimensions on
+    three of those four slots were already stale/wrong before this fix, unrelated to it.
+    Reported by the user as a save that "took 32 seconds" and "the file grew to 35 MB" —
+    root-caused to this redundancy (file size confirmed stable across repeated saves, not
+    literally growing further each time, but the same ~28MB of avoidable writes every
+    single save) compounding an unrelated, unrepeatable slowdown that turned out to be
+    the user editing directly off an SD card, not a code issue (see CLAUDE.md's own "Save"
+    section for the full investigation writeup).
+    """
+    img = Image.open(jpeg_path).convert("RGB")
+    img.save(jpeg_path, quality=SAVE_PREVIEW_QUALITY)
+    w, h = img.size
+    scale = SAVE_THUMB_MAX_SIDE / max(w, h)
+    thumb = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS) if scale < 1 else img
+    thumb_path = os.path.join(out_dir, "preview_thumb.jpg")
+    thumb.save(thumb_path, quality=SAVE_PREVIEW_QUALITY)
+    return jpeg_path, thumb_path
+
+
 def compute_rgb_histogram(image_path: str, bins: int = 256):
     """Per-channel pixel counts for HistogramWidget, computed directly from whatever JPEG
     Adobe DNG Converter just rendered (see DNGForge._on_dngconv_render_ready()) — the exact
@@ -3348,6 +3415,38 @@ class DNGForge(QMainWindow):
         # (not deleted immediately on file switch — a background thread may still be
         # using one; safe to just let them accumulate for one session and clean up on exit)
 
+        # "Default preview" toggle (zoom toolbar, next to the ⓘ XMP/EXIF/Metadata buttons) —
+        # see _toggle_default_preview()/_start_default_preview_render(). A pure display swap:
+        # renders the image with every control at reset_controls()'s own default values
+        # EXCEPT crop/rotation (kept at the real, current self.crop), and shows that instead
+        # of self._preview_pixmap until toggled off — never touches the actual widget state,
+        # undo history, or the file itself.
+        self._default_preview_active = False
+        self._default_preview_pixmap = None
+        self._default_preview_thread = None
+        self._default_preview_generation = 0
+        # Session edit cache (load_dng()) — path -> _capture_edit_state() snapshot, for
+        # whichever file was open right before switching to a different one, so working
+        # through a folder of files in the gallery filmstrip without saving each one doesn't
+        # lose adjustments the moment another photo is opened. Deliberately in-memory only,
+        # not written to disk — the same "usa e getta", session-only convention already used
+        # for the gallery filmstrip and Copy/Paste Settings (self._settings_clipboard): this
+        # is about not losing work while clicking between photos in one running session, not
+        # about surviving an app crash or restart (which would need loading it back on next
+        # launch too, a materially bigger feature nobody asked for). revert_to_saved() clears
+        # a file's own entry before reloading it — see that method — so an explicit revert
+        # can't be silently undone by this cache handing the discarded state right back.
+        self._session_edit_cache = {}
+
+        self._default_preview_src_paths = {}  # generation -> disposable work.dng copy the
+        # in-flight thread for that generation is writing tags onto — can't reuse
+        # self._work_dng_path directly, since the normal live pipeline can be writing to
+        # it at the same moment (DngConverterRenderThread writes its XMP tags in place via
+        # -overwrite_original). Keyed by generation, not a single shared path, for the same
+        # reason _thumbnail_scan_dirs is (see that dict's own docstring in open_folder()) —
+        # a shared attribute would let a second toggle started before the first one's
+        # cleanup ran delete the *new* one's file instead of its own.
+
         # Gallery filmstrip (File → Apri cartella…, see open_folder()/FilmstripWidget) — see
         # ThumbnailScanThread's own docstring for why generation/scratch-dir cleanup are split
         # the way they are.
@@ -3566,6 +3665,19 @@ class DNGForge(QMainWindow):
         zoom_bar.addWidget(zoom_in_btn)
         zoom_bar.addWidget(self.zoom_select_btn)
         zoom_bar.addStretch(1)
+        # "Default preview" toggle — shows the image as if every control were at its
+        # reset_controls() default, keeping the real crop/rotation, so the user can quickly
+        # compare "what the file actually looked like before editing" (user-requested,
+        # explicitly on/off toggle logic like a before/after view) — see
+        # _toggle_default_preview()/_start_default_preview_render().
+        self.default_preview_btn = QPushButton("👁 Default")
+        self.default_preview_btn.setCheckable(True)
+        self.default_preview_btn.setToolTip(
+            "Mostra l'anteprima con tutti i controlli ai valori di default "
+            "(crop/raddrizzamento esclusi, restano quelli attuali) — on/off"
+        )
+        self.default_preview_btn.clicked.connect(self._toggle_default_preview)
+        zoom_bar.addWidget(self.default_preview_btn)
         # Two separate debug-info buttons, split at the user's own request once they realized
         # a freshly-downloaded (never edited) DNG has no -XMP-crs:* data at all — the editing
         # "recipe" (XMP-crs) and the camera's own capture/calibration data (EXIF: ColorMatrix,
@@ -3646,10 +3758,13 @@ class DNGForge(QMainWindow):
         another CollapsibleGroupBox works correctly (the outer one's collapse just
         shows/hides the inner box wholesale, without touching the inner box's own checked
         state), so nothing about that earlier per-control tuning needed to be lost in the
-        merge. Radial/Graduated Filter, Spot Removal and Crop & Straighten are DNGForge's own
-        on-canvas tools with no equivalent permanent side-panel section in real Lightroom
-        (there they're toolbar icons overlaid on the canvas, not Develop-panel entries), so
-        they're left exactly where they were, after the Lightroom-mirrored panels above.
+        merge. Radial/Graduated Filter and Spot Removal are DNGForge's own on-canvas tools with
+        no equivalent permanent side-panel section in real Lightroom (there they're toolbar
+        icons overlaid on the canvas, not Develop-panel entries), so they're left after the
+        Lightroom-mirrored panels above. Crop & Straighten is the one on-canvas tool NOT left
+        there — moved inside the Basic panel, directly above White Balance, at the user's
+        explicit request (workflow order: straighten/crop the frame first, then judge white
+        balance/tone against the final framing, not the other way around).
         """
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -3682,6 +3797,52 @@ class DNGForge(QMainWindow):
         profile_layout.addWidget(self.profile_combo)
         basic_layout.addWidget(profile_group)
 
+        # Crop & Straighten (roadmap items 8-9) — only ever affects the rendered preview/JPEG,
+        # never self.raw or the DNG's own pixel data, same non-destructive convention as every
+        # other adjustment (confirmed with the user explicitly). Straighten's Rotation slider
+        # auto-clamps the crop rectangle to stay inside the rotated frame's valid area — see
+        # clamp_crop_to_rotation()/max_inscribed_rect(). Placed right above White Balance, not
+        # after the Lightroom-mirrored panels below (its original position) — user-requested
+        # ("sposta crop straighten subito sopra white balance perché è una delle prime
+        # operazioni che si fa"): straightening/cropping the frame is naturally done before
+        # judging white balance/tone on the final framing, not after.
+        crop_group = QGroupBox("Crop & Straighten")
+        crop_layout = QVBoxLayout(crop_group)
+
+        # Single "Crop" toggle, Lightroom-style (like pressing R): checking it *enters*
+        # editing mode (full frame + rectangle guide, creating a default full-frame
+        # rectangle only the first time — an existing/restored crop is shown as-is, never
+        # reset), unchecking it *commits* whatever rectangle is currently set and shows the
+        # actual cropped result. Toggling it on/off never discards the crop by itself —
+        # only the separate "Reset" button does that (same Place/Remove split the radial
+        # and gradient filters already use, chosen after the user tried a single
+        # enable/disable button and found it confusingly discarded their crop on re-check).
+        crop_buttons = QHBoxLayout()
+        self.crop_enable_btn = QPushButton("Crop")
+        self.crop_enable_btn.setCheckable(True)
+        self.crop_enable_btn.clicked.connect(self._toggle_crop_enable)
+        self.crop_reset_btn = QPushButton("Reset")
+        self.crop_reset_btn.setVisible(False)
+        self.crop_reset_btn.clicked.connect(self._reset_crop)
+        crop_buttons.addWidget(self.crop_enable_btn)
+        crop_buttons.addWidget(self.crop_reset_btn)
+        crop_layout.addLayout(crop_buttons)
+
+        self.crop_controls = QWidget()
+        cc_layout = QVBoxLayout(self.crop_controls)
+        cc_layout.setContentsMargins(0, 0, 0, 0)
+        self.crop_aspect_combo = NoWheelComboBox()
+        self.crop_aspect_combo.addItems(list(CROP_ASPECT_RATIOS.keys()))
+        self.crop_aspect_combo.currentIndexChanged.connect(self._on_crop_aspect_changed)
+        cc_layout.addWidget(self.crop_aspect_combo)
+        self.crop_rotation_slider = Slider("Rotation", -45, 45, 0, step=0.1, decimals=1,
+                                            on_change=self._on_crop_rotation_changed)
+        cc_layout.addWidget(self.crop_rotation_slider)
+        self.crop_controls.setVisible(False)
+        crop_layout.addWidget(self.crop_controls)
+
+        basic_layout.addWidget(crop_group)
+
         # White Balance
         wb_group = QGroupBox("White Balance")
         wb_layout = QVBoxLayout(wb_group)
@@ -3706,24 +3867,41 @@ class DNGForge(QMainWindow):
 
         basic_layout.addWidget(wb_group)
 
+        # Basic Corrections (Exposure/Contrast) — split out of Tone into its own group,
+        # user-requested: conceptually these are whole-image adjustments the user wants to
+        # set once and keep, independent of the Tone panel's Auto/Default/Eye Perception/
+        # Custom recipe-cycling ("il tone 'default' non deve toccare i valori di exposure e
+        # contrast... ecco perché è importante spostare questi due valori fuori da tone").
+        # Their own on_change is a plain _schedule_update() (like Presence's sliders), not
+        # _on_tone_slider_changed() — nudging them no longer flips tone_mode to "Custom",
+        # since they're no longer part of what that combo tracks at all. Still disabled
+        # together with the Tone sliders while Tone Mode is Auto (_set_tone_controls_enabled())
+        # — AutoTone is a single XMP concept covering the whole basic recipe (Adobe computes
+        # Exposure2012/Contrast2012 too, not just Highlights/Shadows/Whites/Blacks), a tag-
+        # level fact that doesn't change just because the UI groups them differently now.
+        basic_corrections_group = QGroupBox("Basic Corrections")
+        basic_corrections_layout = QVBoxLayout(basic_corrections_group)
+        self.exposure_slider = Slider("Exposure", -5, 5, 0, decimals=2, on_change=self._schedule_update)
+        self.contrast_slider = Slider("Contrast", -100, 100, 0, on_change=self._schedule_update)
+        for s in (self.exposure_slider, self.contrast_slider):
+            basic_corrections_layout.addWidget(s)
+        basic_layout.addWidget(basic_corrections_group)
+
         # Tone
         tone_group = QGroupBox("Tone")
         tone_layout = QVBoxLayout(tone_group)
 
         self.tone_mode = NoWheelComboBox()
-        self.tone_mode.addItems(["Auto", "Default", "Vivace", "Custom"])
+        self.tone_mode.addItems(["Auto", "Default", "Eye Perception", "Custom"])
         self.tone_mode.setCurrentText("Default")
         self.tone_mode.currentIndexChanged.connect(self._on_tone_mode_changed)
         tone_layout.addWidget(self.tone_mode)
 
-        self.exposure_slider = Slider("Exposure", -3, 3, 0, decimals=2, on_change=self._on_tone_slider_changed)
-        self.contrast_slider = Slider("Contrast", -100, 100, 0, on_change=self._on_tone_slider_changed)
         self.highlights_slider = Slider("Highlights", -100, 100, 0, on_change=self._on_tone_slider_changed)
         self.shadows_slider = Slider("Shadows", -100, 100, 0, on_change=self._on_tone_slider_changed)
         self.whites_slider = Slider("Whites", -100, 100, 0, on_change=self._on_tone_slider_changed)
         self.blacks_slider = Slider("Blacks", -100, 100, 0, on_change=self._on_tone_slider_changed)
-        for s in (self.exposure_slider, self.contrast_slider, self.highlights_slider,
-                  self.shadows_slider, self.whites_slider, self.blacks_slider):
+        for s in (self.highlights_slider, self.shadows_slider, self.whites_slider, self.blacks_slider):
             tone_layout.addWidget(s)
         basic_layout.addWidget(tone_group)
 
@@ -4132,48 +4310,6 @@ class DNGForge(QMainWindow):
         spot_layout.addWidget(self.spot_controls)
 
         layout.addWidget(spot_group)
-
-        # Crop & Straighten (roadmap items 8-9) — only ever affects the rendered preview/JPEG,
-        # never self.raw or the DNG's own pixel data, same non-destructive convention as every
-        # other adjustment (confirmed with the user explicitly). Straighten's Rotation slider
-        # auto-clamps the crop rectangle to stay inside the rotated frame's valid area — see
-        # clamp_crop_to_rotation()/max_inscribed_rect().
-        crop_group = QGroupBox("Crop & Straighten")
-        crop_layout = QVBoxLayout(crop_group)
-
-        # Single "Crop" toggle, Lightroom-style (like pressing R): checking it *enters*
-        # editing mode (full frame + rectangle guide, creating a default full-frame
-        # rectangle only the first time — an existing/restored crop is shown as-is, never
-        # reset), unchecking it *commits* whatever rectangle is currently set and shows the
-        # actual cropped result. Toggling it on/off never discards the crop by itself —
-        # only the separate "Reset" button does that (same Place/Remove split the radial
-        # and gradient filters already use, chosen after the user tried a single
-        # enable/disable button and found it confusingly discarded their crop on re-check).
-        crop_buttons = QHBoxLayout()
-        self.crop_enable_btn = QPushButton("Crop")
-        self.crop_enable_btn.setCheckable(True)
-        self.crop_enable_btn.clicked.connect(self._toggle_crop_enable)
-        self.crop_reset_btn = QPushButton("Reset")
-        self.crop_reset_btn.setVisible(False)
-        self.crop_reset_btn.clicked.connect(self._reset_crop)
-        crop_buttons.addWidget(self.crop_enable_btn)
-        crop_buttons.addWidget(self.crop_reset_btn)
-        crop_layout.addLayout(crop_buttons)
-
-        self.crop_controls = QWidget()
-        cc_layout = QVBoxLayout(self.crop_controls)
-        cc_layout.setContentsMargins(0, 0, 0, 0)
-        self.crop_aspect_combo = NoWheelComboBox()
-        self.crop_aspect_combo.addItems(list(CROP_ASPECT_RATIOS.keys()))
-        self.crop_aspect_combo.currentIndexChanged.connect(self._on_crop_aspect_changed)
-        cc_layout.addWidget(self.crop_aspect_combo)
-        self.crop_rotation_slider = Slider("Rotation", -45, 45, 0, step=0.1, decimals=1,
-                                            on_change=self._on_crop_rotation_changed)
-        cc_layout.addWidget(self.crop_rotation_slider)
-        self.crop_controls.setVisible(False)
-        crop_layout.addWidget(self.crop_controls)
-
-        layout.addWidget(crop_group)
 
         # Metadata — read-only, exact field list/order requested by the user (roadmap item 10).
         # Used to live as its own always-visible sidebar QGroupBox; folded into a third ⓘ
@@ -4665,10 +4801,16 @@ class DNGForge(QMainWindow):
         if self.crop is None:
             self.crop = {"angle": 0.0, "left": 0.0, "top": 0.0, "right": 1.0, "bottom": 1.0}
             self.crop_rotation_slider.set_value(0.0)
+            # Default to "Original" (the raw's own aspect ratio), not Freeform —
+            # user-requested. A fresh crop already starts as the full 0..1 frame, which by
+            # definition already *is* the original aspect ratio in fraction space (any
+            # target-ratio's frac_ratio = ratio*h/w reduces to exactly 1.0 when
+            # ratio == w/h, see _apply_crop_aspect_ratio()) — so this only needs to *arm*
+            # the constraint for the next drag, not reshape anything.
             self.crop_aspect_combo.blockSignals(True)
-            self.crop_aspect_combo.setCurrentIndex(0)  # Freeform
+            self.crop_aspect_combo.setCurrentText("Original")
             self.crop_aspect_combo.blockSignals(False)
-            self.image_label.crop_aspect = None
+            self.image_label.crop_aspect = 1.0
         self._crop_editing = checked
         self.crop_controls.setVisible(True)
         self.crop_reset_btn.setVisible(True)
@@ -4802,22 +4944,58 @@ class DNGForge(QMainWindow):
     def _on_tone_mode_changed(self):
         mode = self.tone_mode.currentText()
         if mode == "Default":
-            self.exposure_slider.set_value(0)
-            self.contrast_slider.set_value(0)
+            # Deliberately does NOT touch Exposure/Contrast — user-requested: those moved
+            # out to their own "Basic Corrections" group specifically so Tone's own
+            # Auto/Default/Eye Perception/Custom cycling never resets them (see that
+            # group's own __init__/build comment for the full rationale).
             self.highlights_slider.set_value(0)
             self.shadows_slider.set_value(0)
             self.whites_slider.set_value(0)
             self.blacks_slider.set_value(0)
-        elif mode == "Vivace":
+            # Also clears the HSL corrections "Eye Perception" sets (Red/Orange Saturation,
+            # Red Luminance) — user-requested, same "always write/reset the off-state too"
+            # convention already used throughout this app (HasCrop, WhiteBalance, Black &
+            # White, ...): switching from Eye Perception back to Default must not leave
+            # those stranded, since they exist specifically to compensate for Eye
+            # Perception's own Presence boost and mean nothing once that's gone.
+            self.hsl_saturation_sliders["Red"].set_value(0)
+            self.hsl_saturation_sliders["Orange"].set_value(0)
+            self.hsl_luminance_sliders["Red"].set_value(0)
+        elif mode == "Eye Perception":
+            # Tone: perceptual/local-adaptation dynamic-range compression, see CLAUDE.md's
+            # "Vivace" / "Eye Perception" writeup for the full rationale — this is not a
+            # literal "increase contrast" reading of these four sliders.
             self.highlights_slider.set_value(-50)
             self.shadows_slider.set_value(50)
             self.whites_slider.set_value(-50)
             self.blacks_slider.set_value(50)
+            # Presence: restores the local contrast/punch the tone compression above gave up —
+            # user-requested, same "flatten globally, punch back locally" pairing already
+            # documented for the tone values themselves.
+            self.texture_slider.set_value(10)
+            self.clarity_slider.set_value(10)
+            self.dehaze_slider.set_value(10)
+            self.vibrance_slider.set_value(10)
+            self.saturation_slider.set_value(10)
+            # HSL: reds are usually the first channel to clip when Presence is pushed (least
+            # headroom in most camera color science) — user-observed, corrected selectively
+            # here rather than pulling back Vibrance/Saturation globally.
+            self.hsl_saturation_sliders["Red"].set_value(-10)
+            self.hsl_luminance_sliders["Red"].set_value(-10)
+            # Orange carries skin tones — pushed Vibrance/Saturation without a correction
+            # here reliably turns skin an unnatural orange/carrot tone ("altrimenti la pelle
+            # viene a carota", user-observed as needed almost every time), the same class of
+            # per-channel correction as the Red one above, just for a different failure mode.
+            self.hsl_saturation_sliders["Orange"].set_value(-20)
+            # Curve: an S-curve adds midtone contrast — a third, complementary way of
+            # recovering vivacity (midtones) alongside Presence (local detail/haze) and the
+            # HSL Red correction (color) — user-requested as the final piece of the recipe.
+            self.curve_combo.setCurrentText("Strong Contrast")
         self._set_tone_controls_enabled(mode != "Auto")
         self._schedule_update()
 
     def _on_tone_slider_changed(self):
-        if self.tone_mode.currentText() in ("Default", "Vivace"):
+        if self.tone_mode.currentText() in ("Default", "Eye Perception"):
             self.tone_mode.blockSignals(True)
             self.tone_mode.setCurrentText("Custom")
             self.tone_mode.blockSignals(False)
@@ -4929,6 +5107,20 @@ class DNGForge(QMainWindow):
             self._show_dngconv_missing_error()
             return
 
+        # Session edit cache (user-requested, "quando lavoro con una cartella di file... così
+        # quando passo da una foto all'altra senza aver salvato non perdo gli aggiustamenti
+        # fatti") — stash whatever's currently on screen for the file we're switching *away*
+        # from, keyed by its own path, before it gets torn down below. In-memory and
+        # session-only, the same "usa e getta" convention already used for the gallery
+        # filmstrip/Copy-Paste Settings — see self._session_edit_cache's own __init__ comment
+        # for why a persistent on-disk store wasn't built (nothing here needs to survive a
+        # crash or an app restart, only switching between photos within one running session).
+        # Skipped on a same-path reload (revert_to_saved() calling load_dng(self.raw_path)
+        # again) — revert_to_saved() itself clears that path's entry instead, since re-caching
+        # the about-to-be-discarded state here would just silently undo the revert.
+        if self.raw_path is not None and self.raw_path != path:
+            self._session_edit_cache[self.raw_path] = self._capture_edit_state()
+
         if self.raw is not None:
             self.raw.close()
 
@@ -4977,8 +5169,17 @@ class DNGForge(QMainWindow):
         )
         # Baseline for the unsaved-changes check in closeEvent() — "what's on disk right now"
         # for a freshly (re)opened file is whatever state was just restored above, saved or
-        # default alike.
+        # default alike. Captured *before* the session-cache restore below, on purpose: the
+        # dirty-check must still compare against the real on-disk state, so a file reopened
+        # with unsaved-this-session edits correctly shows as dirty again (it is).
         self._saved_edit_state = self._capture_edit_state()
+        restored_from_session = path in self._session_edit_cache
+        if restored_from_session:
+            self._apply_edit_state(self._session_edit_cache[path])  # overrides the
+            # just-restored (saved-on-disk-or-default) state with whatever was on screen
+            # for this same file earlier in this session — see load_dng()'s own top-of-
+            # function comment for why this exists and revert_to_saved() for the one path
+            # that deliberately bypasses it
         self._render_preview()
         colorimetry = "colorimetria DNG attiva" if self.camera_profile else "colorimetria approssimata (ColorMatrix non disponibile)"
         restored_bits = []
@@ -4993,6 +5194,8 @@ class DNGForge(QMainWindow):
         if self.crop:
             restored_bits.append("crop")
         edit_state = f" — {' e '.join(restored_bits)} ripristinato/i" if restored_bits else ""
+        if restored_from_session:
+            edit_state += " — modifiche non salvate di questa sessione ripristinate"
         self.statusBar().showMessage(
             f"{os.path.basename(path)} — {self.raw.sizes.width}x{self.raw.sizes.height} "
             f"(caricato in {time.time() - t0:.2f}s, {colorimetry}){edit_state}"
@@ -5495,6 +5698,16 @@ class DNGForge(QMainWindow):
         self._last_zoom_detail_state = None
         self._zoom_detail_pixmap = None
         self._zoom_detail_region = None
+        # Default Preview toggle is per-file too — its pixmap belongs to whichever file was
+        # open when it was rendered, and a stale in-flight thread from the *previous* file
+        # is invalidated by the same generation-bump pattern as the two pipelines above.
+        self._default_preview_active = False
+        self._default_preview_pixmap = None
+        self._default_preview_generation += 1
+        if hasattr(self, "default_preview_btn"):
+            self.default_preview_btn.blockSignals(True)
+            self.default_preview_btn.setChecked(False)
+            self.default_preview_btn.blockSignals(False)
         if self._work_dng_dir is not None:
             self._old_work_dirs.append(self._work_dng_dir)
             self._work_dng_dir = None
@@ -5545,18 +5758,20 @@ class DNGForge(QMainWindow):
 
     def _sync_spinner(self):
         """The spinner overlay (ImageLabel.start_spinner()/stop_spinner()) is active exactly
-        when either background render pipeline — the main preview one below, or the
-        zoom-detail one (see "Zoom detail rendering") — currently has a thread in flight: a
-        plain OR of both pipelines' own state, recomputed fresh on every call rather than
-        paired start/stop calls kept in sync by hand. That matters because both pipelines
+        when any of the three background render pipelines — the main preview one below, the
+        zoom-detail one (see "Zoom detail rendering"), or the Default Preview toggle's own
+        one-off render — currently has a thread in flight: a plain OR of all three
+        pipelines' own state, recomputed fresh on every call rather than paired start/stop
+        calls kept in sync by hand. That matters because the main/zoom-detail pipelines
         settle straight into a queued re-render without an intervening "stop" (see the
         pending/generation queueing in _on_dngconv_render_ready()/_on_zoom_detail_render_ready()) —
         a naive call-count-based start/stop pairing would go out of sync the first time that
-        happens, since one pipeline's "stop" can fire while the other is still rendering.
-        Called after every state change to either self._dngconv_thread or
-        self._zoom_detail_thread, so it's always cheap to call redundantly.
+        happens, since one pipeline's "stop" can fire while another is still rendering.
+        Called after every state change to self._dngconv_thread, self._zoom_detail_thread,
+        or self._default_preview_thread, so it's always cheap to call redundantly.
         """
-        active = self._dngconv_thread is not None or self._zoom_detail_thread is not None
+        active = (self._dngconv_thread is not None or self._zoom_detail_thread is not None
+                  or self._default_preview_thread is not None)
         if active:
             self.image_label.start_spinner()
         else:
@@ -5665,6 +5880,106 @@ class DNGForge(QMainWindow):
             # is not a reason to replace a valid image with nothing, or an internal
             # approximation this app doesn't have.
             self.statusBar().showMessage("Rendering Adobe DNG Converter non riuscito — anteprima invariata", 4000)
+        self._sync_spinner()
+
+    # ---- Default Preview toggle ----
+    # A pure display swap (see _update_image_label()) — user-requested, on/off toggle logic,
+    # to quickly compare the current edit against "the image as generated at the start" —
+    # every control at reset_controls()'s own default, with the current crop/rotation kept
+    # as-is. Never touches the real widget state, undo history, or the file on disk.
+
+    def _toggle_default_preview(self, checked):
+        if not checked:
+            self._default_preview_active = False
+            self._default_preview_pixmap = None
+            self._update_image_label()
+            self.statusBar().showMessage("Anteprima default disattivata", 2000)
+            return
+
+        if self.raw is None or not self._work_dng_path or not os.path.isfile(self._work_dng_path):
+            self.default_preview_btn.setChecked(False)
+            return
+
+        # Build the "default state + current crop" XMP args by briefly swapping every
+        # widget to reset_controls()'s own defaults, capturing what would get written, then
+        # restoring the real edit state — reusing reset_controls() (rather than a second,
+        # hardcoded copy of what "default" means) keeps this in sync with "Virgin-file
+        # defaults match Lightroom, not zero" in CLAUDE.md automatically, forever. The whole
+        # swap is synchronous with no Qt event-loop yield in between, so nothing actually
+        # repaints mid-swap — the widgets never visibly flicker.
+        real_state = self._capture_edit_state()
+        self.reset_controls()
+        self.crop = copy.deepcopy(real_state["crop"])  # the one thing this preview must
+        # NOT reset, per the user's own request — keep the real, current crop/rotation
+        default_args = self._build_all_edit_xmp_args(for_save=True)  # for_save=True: the
+        # real committed crop, regardless of whether the guide happens to be showing right now
+        default_lens_correction = (
+            self._lens_correction if self.lens_profile_checkbox.isChecked() else None
+        )
+        self._apply_edit_state(real_state)  # restores every widget (crop included) and
+        # re-arms the normal debounced pipeline pointed at the real state again — the live
+        # pipeline is completely unaffected by this toggle, it keeps rendering real edits
+        # into self._preview_pixmap in the background exactly as if nothing happened
+
+        self._default_preview_active = True
+        self._start_default_preview_render(default_args, default_lens_correction)
+
+    def _start_default_preview_render(self, xmp_args, lens_correction):
+        self._default_preview_generation += 1
+        generation = self._default_preview_generation
+        out_dir = os.path.dirname(self._work_dng_path)
+        src_path = os.path.join(out_dir, f"default_preview_{uuid.uuid4().hex[:8]}.dng")
+        shutil.copyfile(self._work_dng_path, src_path)  # a disposable copy, not
+        # self._work_dng_path directly — see __init__'s own comment on
+        # _default_preview_src_paths for why the main pipeline writing to that same shared
+        # file concurrently would be a real race, not just a theoretical one
+        self._default_preview_src_paths[generation] = src_path
+        self._default_preview_thread = DngConverterRenderThread(
+            src_path, xmp_args, self.exiftool_path, self._dngconv_path, generation,
+            lens_correction=lens_correction, parent=self,
+        )
+        self._default_preview_thread.ready.connect(self._on_default_preview_ready)
+        self._default_preview_thread.failed.connect(self._on_default_preview_failed)
+        self._default_preview_thread.start()
+        self.statusBar().showMessage("Rendering anteprima default…")
+        self._sync_spinner()
+
+    def _on_default_preview_ready(self, jpeg_path, generation):
+        try:
+            if (generation == self._default_preview_generation and self.raw is not None
+                    and self._default_preview_active):
+                pixmap = QPixmap(jpeg_path)
+                if not pixmap.isNull():
+                    self._default_preview_pixmap = pixmap
+                    self._update_image_label()
+                    self.statusBar().showMessage("Anteprima default pronta", 3000)
+        finally:
+            if os.path.exists(jpeg_path):
+                try:
+                    os.unlink(jpeg_path)
+                except OSError:
+                    pass
+            src_path = self._default_preview_src_paths.pop(generation, None)
+            if src_path and os.path.exists(src_path):
+                try:
+                    os.unlink(src_path)
+                except OSError:
+                    pass
+            self._default_preview_thread = None
+            self._sync_spinner()
+
+    def _on_default_preview_failed(self, generation):
+        self._default_preview_thread = None
+        src_path = self._default_preview_src_paths.pop(generation, None)
+        if src_path and os.path.exists(src_path):
+            try:
+                os.unlink(src_path)
+            except OSError:
+                pass
+        if generation == self._default_preview_generation and self._default_preview_active:
+            self.statusBar().showMessage("Rendering anteprima default non riuscito", 4000)
+            self.default_preview_btn.setChecked(False)
+            self._default_preview_active = False
         self._sync_spinner()
 
     # ---- Zoom detail rendering ----
@@ -6178,6 +6493,12 @@ class DNGForge(QMainWindow):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
+            # Drop this file's session-cache entry *before* reloading — load_dng() itself
+            # only skips caching on a same-path reload, it doesn't know this one is a
+            # deliberate revert; without this, load_dng() would restore the very state the
+            # user just asked to discard right back (see _session_edit_cache's own __init__
+            # comment).
+            self._session_edit_cache.pop(self.raw_path, None)
             self.load_dng(self.raw_path)
 
     def close_photo(self):
@@ -6212,6 +6533,12 @@ class DNGForge(QMainWindow):
                     # don't also close and lose the file on top of a failed save.
                     return
 
+        # Whether saved or discarded (Save/Discard both fall through to here), this file's
+        # session-cache entry must go too — leaving a Discard-ed edit cached would silently
+        # hand it right back if the same file is reopened later this session (see
+        # _session_edit_cache's own __init__ comment). A harmless no-op if nothing was cached.
+        self._session_edit_cache.pop(self.raw_path, None)
+
         # Same generation-bump-and-queue-for-later-cleanup _reset_dngconv_pipeline() does when
         # switching to a *new* file (see that method) — just with no replacement file to build
         # a fresh working copy for, so no thread gets started here.
@@ -6225,6 +6552,12 @@ class DNGForge(QMainWindow):
         self._last_zoom_detail_state = None
         self._zoom_detail_pixmap = None
         self._zoom_detail_region = None
+        self._default_preview_active = False
+        self._default_preview_pixmap = None
+        self._default_preview_generation += 1
+        self.default_preview_btn.blockSignals(True)
+        self.default_preview_btn.setChecked(False)
+        self.default_preview_btn.blockSignals(False)
         if self._work_dng_dir is not None:
             self._old_work_dirs.append(self._work_dng_dir)
             self._work_dng_dir = None
@@ -6526,6 +6859,46 @@ class DNGForge(QMainWindow):
         args.append("-XMP-crs:RetouchAreas=" + build_spot_xmp_value(self.spots))
         return args
 
+    def _compute_save_render_side(self):
+        """The `-side` value save_to_dng() should request from Adobe DNG Converter so the
+        embedded JpgFromRaw lands at roughly SAVE_JPGFROMRAW_TARGET_MP, or None to render at
+        native resolution (no -side flag at all) — user-requested, explicitly including the
+        crop-aware behavior: cropping the frame should *not* shrink the embedded resolution
+        below the target as long as the crop's own native pixel count can still support it
+        ("che siano 12 mp sempre anche se faccio un ritaglio... sfruttando la risoluzione da
+        24"), but a crop tight enough that its native resolution is already below the target
+        must never be upscaled to force it ("se il ritaglio è tale che la foto non può
+        essere 12 mp non fare upscaling, lascia la risoluzione che viene") — the same "never
+        invent detail beyond the sensor" rule already established for zoom-detail rendering
+        (see CLAUDE.md, "Zoom detail rendering").
+
+        Adobe DNG Converter applies crop tags *after* scaling to the requested -side (see
+        CLAUDE.md's own "Zoom detail rendering" investigation — the reason that pipeline
+        renders the *whole* effective frame at a big enough -side rather than asking Adobe to
+        crop-and-scale in one step directly to a small target), so hitting a *post-crop*
+        pixel target means requesting a *larger* full-frame -side, scaled up by how much of
+        the frame's area the crop actually keeps.
+
+        Ignores rotation (same scope limit as `_region_within_effective_crop()`/
+        `_local_filters_for_render()` elsewhere — a rotated crop's true post-rotation area
+        isn't simply width-fraction × height-fraction) — falls back to native resolution in
+        that case, same graceful-degradation convention already used for those.
+        """
+        native_w, native_h = self.raw.sizes.width, self.raw.sizes.height
+        crop = self._effective_crop_for_render(for_save=True)
+        if crop and not crop.get("angle"):
+            crop_area_frac = max(0.0, crop["right"] - crop["left"]) * max(0.0, crop["bottom"] - crop["top"])
+        else:
+            crop_area_frac = 1.0
+        if crop_area_frac <= 0:
+            return None
+        native_crop_mp = (native_w * native_h) * crop_area_frac / 1e6
+        if native_crop_mp <= SAVE_JPGFROMRAW_TARGET_MP:
+            return None  # crop's own native resolution is already at/below the target —
+            # never upscale past what the sensor actually captured
+        native_long_edge = max(native_w, native_h)
+        return round(native_long_edge * math.sqrt(SAVE_JPGFROMRAW_TARGET_MP / native_crop_mp))
+
     def save_to_dng(self):
         """Render full resolution via Adobe DNG Converter — the sole renderer in this app,
         see CLAUDE.md — and embed the result + the edit state into the DNG in place.
@@ -6574,6 +6947,12 @@ class DNGForge(QMainWindow):
             lens_correction = self._lens_correction if self.lens_profile_checkbox.isChecked() else None
             has_local = bool(self.radial_filters or self.gradient_filters or self.spots)
             local = self._local_filters_for_render(for_save=True) if has_local else None
+            # Caps the embedded JpgFromRaw at SAVE_JPGFROMRAW_TARGET_MP — user-requested,
+            # a 24MP+ sensor's own native resolution was "anche troppi" for an embedded
+            # preview — crop-aware (see _compute_save_render_side()'s own docstring): a
+            # crop still reaches the target as long as its own native pixel count supports
+            # it, but is never upscaled past that when it doesn't.
+            render_side = self._compute_save_render_side()
             if local is not None:
                 radial, gradient, spots = local
                 base_args = self._build_xmp_crs_args(for_save=True)
@@ -6583,19 +6962,28 @@ class DNGForge(QMainWindow):
                 jpeg_path = _render_local_adjustments_composite(
                     temp_full, base_args, base_exposure, base_contrast, base_saturation,
                     radial, gradient, spots, self.exiftool_path, self._dngconv_path,
-                    lens_correction=lens_correction,
+                    side=render_side, lens_correction=lens_correction,
                 )
                 if jpeg_path is None:
                     raise RuntimeError(
                         "Adobe DNG Converter non è riuscito a renderizzare le correzioni locali a piena risoluzione"
                     )
             else:
-                with exiftool.ExifToolHelper(executable=self.exiftool_path) as et:
-                    et.execute(*xmp_args, "-overwrite_original", temp_full)
+                # Shared, kept-alive exiftool process (_persistent_exiftool_execute(), see its
+                # own docstring) instead of a fresh `with ExifToolHelper(...) as et:` spawn —
+                # user-flagged a full save as unexpectedly slow; profiling save_to_dng() found
+                # two separate ~0.3s process-startup costs here and at the final write below,
+                # on top of everything else. The render pipeline already made this exact switch
+                # for the same reason; this call site just hadn't been touched since.
+                _persistent_exiftool_execute(self.exiftool_path, *xmp_args, "-overwrite_original", temp_full)
 
                 rendered_path = os.path.join(render_dir, "rendered.dng")
+                convert_args = [self._dngconv_path, "-c"]
+                if render_side:
+                    convert_args += ["-side", str(render_side)]
+                convert_args += ["-p2", "-d", render_dir, "-o", "rendered.dng", temp_full]
                 result = subprocess.run(
-                    [self._dngconv_path, "-c", "-p2", "-d", render_dir, "-o", "rendered.dng", temp_full],
+                    convert_args,
                     capture_output=True, timeout=180, creationflags=_NO_WINDOW_FLAGS,
                 )
                 if result.returncode != 0 or not os.path.isfile(rendered_path):
@@ -6606,6 +6994,12 @@ class DNGForge(QMainWindow):
                     raise RuntimeError("Impossibile estrarre l'anteprima renderizzata da Adobe DNG Converter")
                 _apply_lensfun_correction(jpeg_path, lens_correction)
 
+            # Re-encode the full-resolution render at SAVE_PREVIEW_QUALITY and carve out a
+            # genuinely small thumbnail — see _prepare_save_preview_jpegs()'s own docstring
+            # for why this exists (avoids re-bloating IFD0/SubIFD1/PreviewIFD to full
+            # resolution, a confirmed real issue on a real user file, DSC_6795.dng).
+            jpeg_path, preview_thumb_path = _prepare_save_preview_jpegs(jpeg_path, render_dir)
+
             # release our read handle before exiftool rewrites the *original* file in
             # place — on Windows a rename-over-open-file fails silently otherwise (the
             # exact bug we found and root-caused in RethinkRAW)
@@ -6613,7 +7007,12 @@ class DNGForge(QMainWindow):
             self.raw = None
 
             args = [
-                "-PreviewImage<=" + jpeg_path,
+                # A genuinely small thumbnail, not the full-resolution render — this single
+                # directive writes into *every* physical "PreviewImage" slot this DNG
+                # structure has (IFD0/SubIFD1/PreviewIFD), so feeding it a small file here
+                # keeps all three small, instead of tripling the full-resolution JpgFromRaw
+                # copy below into three more places. See _prepare_save_preview_jpegs().
+                "-PreviewImage<=" + preview_thumb_path,
                 # Some DNGs (notably ones run through Adobe DNG Converter's -lossy mode,
                 # like this project's own test file) also embed a *separate* full-res JPEG
                 # under the distinct "JpgFromRaw" tag (SubIFD2 in that structure) — never
@@ -6658,8 +7057,7 @@ class DNGForge(QMainWindow):
             args += ["-tagsfromfile", "@", "-FileModifyDate<DateTimeOriginal", "-FileCreateDate<DateTimeOriginal"]
             args += ["-overwrite_original", path]
 
-            with exiftool.ExifToolHelper(executable=self.exiftool_path) as et:
-                et.execute(*args)
+            _persistent_exiftool_execute(self.exiftool_path, *args)
 
             self.statusBar().showMessage(
                 f"Salvato in {os.path.basename(path)} ({time.time() - t0:.1f}s) — "
@@ -6669,6 +7067,14 @@ class DNGForge(QMainWindow):
             # (see that method) — captured *after* the write succeeds, not before, so a failed
             # save correctly leaves the file still considered dirty.
             self._saved_edit_state = self._capture_edit_state()
+            # A successful save also invalidates this file's session-cache entry (see
+            # _session_edit_cache's own __init__ comment): "cached unsaved state" and "what's
+            # now on disk" are identical at this exact moment, so there's nothing left for the
+            # cache to usefully restore — and leaving the *old*, pre-save entry behind would
+            # resurrect stale edits if this same file is ever reloaded again this session
+            # (revert_to_saved() already handles its own case; this covers every other path
+            # that can trigger a save, since they all funnel through this one function).
+            self._session_edit_cache.pop(self.raw_path, None)
             return True
         except Exception as e:
             QMessageBox.critical(self, "Salvataggio non riuscito", str(e))
@@ -6747,8 +7153,13 @@ class DNGForge(QMainWindow):
                     )
                 shutil.move(composited_path, out_path)
             else:
-                with exiftool.ExifToolHelper(executable=self.exiftool_path) as et:
-                    et.execute(*xmp_args, "-overwrite_original", temp_full)
+                # Shared, kept-alive exiftool process (_persistent_exiftool_execute(), see its
+                # own docstring) instead of a fresh `with ExifToolHelper(...) as et:` spawn —
+                # user-flagged a full save as unexpectedly slow; profiling save_to_dng() found
+                # two separate ~0.3s process-startup costs here and at the final write below,
+                # on top of everything else. The render pipeline already made this exact switch
+                # for the same reason; this call site just hadn't been touched since.
+                _persistent_exiftool_execute(self.exiftool_path, *xmp_args, "-overwrite_original", temp_full)
 
                 rendered_path = os.path.join(render_dir, "rendered.dng")
                 result = subprocess.run(
@@ -6792,18 +7203,20 @@ class DNGForge(QMainWindow):
             #   4. The pre-existing DateTimeOriginal-based OS timestamp fix (unchanged).
             timestamp_note = ""
             try:
-                with exiftool.ExifToolHelper(executable=self.exiftool_path) as et:
-                    et.execute(
-                        "-tagsfromfile", self.raw_path, "-all:all", "--xmp-crs:all",
-                        f"-EXIF:Software={APP_SOFTWARE_NAME}",
-                        f"-XMP-xmp:CreatorTool={APP_SOFTWARE_NAME}",
-                        "-tagsfromfile", "@",
-                        "-ExifIFD:ExifImageWidth<File:ImageWidth",
-                        "-ExifIFD:ExifImageHeight<File:ImageHeight",
-                        "-tagsfromfile", self.raw_path,
-                        "-FileModifyDate<DateTimeOriginal", "-FileCreateDate<DateTimeOriginal",
-                        "-overwrite_original", out_path,
-                    )
+                # Shared, kept-alive exiftool process — see the matching comment in
+                # save_to_dng() for why.
+                _persistent_exiftool_execute(
+                    self.exiftool_path,
+                    "-tagsfromfile", self.raw_path, "-all:all", "--xmp-crs:all",
+                    f"-EXIF:Software={APP_SOFTWARE_NAME}",
+                    f"-XMP-xmp:CreatorTool={APP_SOFTWARE_NAME}",
+                    "-tagsfromfile", "@",
+                    "-ExifIFD:ExifImageWidth<File:ImageWidth",
+                    "-ExifIFD:ExifImageHeight<File:ImageHeight",
+                    "-tagsfromfile", self.raw_path,
+                    "-FileModifyDate<DateTimeOriginal", "-FileCreateDate<DateTimeOriginal",
+                    "-overwrite_original", out_path,
+                )
             except Exception:
                 timestamp_note = " (metadati/timestamp non impostati: errore exiftool)"
 
@@ -6819,11 +7232,19 @@ class DNGForge(QMainWindow):
                 shutil.rmtree(render_dir, ignore_errors=True)
 
     def _update_image_label(self):
-        if getattr(self, "_preview_pixmap", None) is None:
+        # Default Preview toggle (see _toggle_default_preview()): a pure display swap — show
+        # its own separately-rendered pixmap instead of self._preview_pixmap while active,
+        # without touching self._preview_pixmap itself (the real live-edit pipeline keeps
+        # rendering into it normally in the background, so turning the toggle back off shows
+        # up-to-date real pixels immediately, no re-render needed).
+        show_default = (getattr(self, "_default_preview_active", False)
+                         and self._default_preview_pixmap is not None)
+        pixmap = self._default_preview_pixmap if show_default else getattr(self, "_preview_pixmap", None)
+        if pixmap is None:
             return
         if self._zoom_level is None:
             self.image_scroll.setWidgetResizable(True)
-            scaled = self._preview_pixmap.scaled(
+            scaled = pixmap.scaled(
                 self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
             self.image_label.setPixmap(scaled)
@@ -6831,10 +7252,14 @@ class DNGForge(QMainWindow):
             # Explicit zoom: the label takes its own (larger-than-viewport) size and the
             # QScrollArea shows scrollbars, instead of always fitting to the viewport.
             self.image_scroll.setWidgetResizable(False)
-            w = max(1, int(self._preview_pixmap.width() * self._zoom_level))
-            h = max(1, int(self._preview_pixmap.height() * self._zoom_level))
-            scaled = self._preview_pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            if self._zoom_detail_pixmap is not None and self._zoom_detail_region is not None:
+            w = max(1, int(pixmap.width() * self._zoom_level))
+            h = max(1, int(pixmap.height() * self._zoom_level))
+            scaled = pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # Skip the zoom-detail patch while showing the default preview — that patch is
+            # always a real render of the *current* edit state (see "Zoom detail rendering"),
+            # so compositing it here would paste real edited pixels onto a default-state
+            # background, a real mismatch rather than a faithful "before" view.
+            if not show_default and self._zoom_detail_pixmap is not None and self._zoom_detail_region is not None:
                 scaled = self._compose_zoom_detail(scaled)
             self.image_label.setPixmap(scaled)
             self.image_label.resize(scaled.size())
