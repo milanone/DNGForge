@@ -3245,7 +3245,7 @@ return paths using forward slashes as the separator — a Qt cross-platform conv
 Qt — *even on Windows*. `open_folder()` fed that forward-slash folder path straight into
 `os.path.join(folder, n)` to build each file's full path; `os.path.join()` on Windows appends with
 a **backslash**, so the result was a genuinely mixed-separator string, e.g.
-`C:/Users/milan/Downloads/dng_lossy\DSC_6831.dng`. Plain Windows file APIs generally tolerate this
+`C:/Users/me/Downloads/dng_lossy\DSC_0001.dng`. Plain Windows file APIs generally tolerate this
 fine (both slash styles work interchangeably in most contexts) — but `send2trash`'s Windows
 backend needs to prepend the `\\?\` long-path prefix internally, and a `\\?\`-prefixed path is
 **not** normalized by Windows at all: it must already be a fully-qualified, backslash-only path,
