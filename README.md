@@ -54,7 +54,9 @@ The (optional) argument loads a DNG on startup.
 - Undo/redo (20-state stack) + revert to last save
 - Per-session edit cache: switching between photos while working through a folder never
   loses unsaved adjustments, even without saving each one first
-- EXIF metadata panel, filmstrip gallery to browse a folder
+- EXIF metadata panel, filmstrip gallery to browse a folder, with a green/red dot on each
+  thumbnail showing whether it's saved with edits or has changes still pending, and a
+  right-click "Delete" that moves the file to the Recycle Bin
 - Copy/paste settings between photos
 - RGB histogram
 

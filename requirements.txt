@@ -5,3 +5,4 @@ PyExifTool
 Pillow
 opencv-python
 lensfunpy
+send2trash

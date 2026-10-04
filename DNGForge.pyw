@@ -3,6 +3,7 @@ import os
 import math
 import time
 import copy
+import json
 import shutil
 import subprocess
 import tempfile
@@ -27,11 +28,17 @@ try:
 except ImportError:
     HAVE_LENSFUNPY = False
 
+try:
+    import send2trash
+    HAVE_SEND2TRASH = True
+except ImportError:
+    HAVE_SEND2TRASH = False
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QSlider, QVBoxLayout,
     QHBoxLayout, QPushButton, QFileDialog, QGroupBox,
     QComboBox, QSplitter, QScrollArea, QSizePolicy, QMessageBox, QCheckBox,
-    QRubberBand, QDialog, QPlainTextEdit, QLineEdit, QToolButton, QFrame,
+    QRubberBand, QDialog, QPlainTextEdit, QLineEdit, QToolButton, QFrame, QMenu,
 )
 from PySide6.QtGui import (
     QPixmap, QAction, QPainter, QPen, QColor, QFont, QDoubleValidator, QIntValidator, QIcon,
@@ -1447,13 +1454,22 @@ class FilmstripWidget(QWidget):
     """
 
     photoActivated = Signal(str)  # emitted with a DNG path when a thumbnail is clicked
+    photoDeleteRequested = Signal(str)  # emitted with a DNG path from the right-click menu's
+    # "Elimina foto…" — this widget never touches the disk itself, DNGForge owns the actual
+    # confirmation dialog and send2trash() call (see _delete_photo_from_filmstrip())
 
     THUMB_SIZE = 90
+
+    # Status badge colors — green for "saved with edits, nothing pending", red for "has
+    # edits not yet written to disk" (see set_status() for the full state meaning).
+    STATUS_COLORS = {"saved": QColor(56, 176, 72), "unsaved": QColor(214, 57, 49)}
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(self.THUMB_SIZE + 36)
         self._buttons = {}  # path -> QToolButton
+        self._thumb_pixmaps = {}  # path -> the plain, un-badged decoded thumbnail
+        self._statuses = {}  # path -> "saved" / "unsaved" / absent (no badge)
         self._current_path = None
 
         outer = QHBoxLayout(self)
@@ -1479,6 +1495,8 @@ class FilmstripWidget(QWidget):
         for btn in self._buttons.values():
             btn.deleteLater()
         self._buttons = {}
+        self._thumb_pixmaps = {}
+        self._statuses = {}
         self._current_path = None
         while self.strip_layout.count() > 1:  # everything except the trailing stretch
             item = self.strip_layout.takeAt(0)
@@ -1495,9 +1513,39 @@ class FilmstripWidget(QWidget):
             btn.setCheckable(True)
             btn.setToolTip(os.path.basename(path))
             btn.clicked.connect(lambda checked=False, p=path: self.photoActivated.emit(p))
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda pos, b=btn, p=path: self._show_context_menu(b, pos, p)
+            )
             self._buttons[path] = btn
             self.strip_layout.insertWidget(self.strip_layout.count() - 1, btn)
         self.show()
+
+    def _show_context_menu(self, btn, pos, path):
+        """Right-click on a thumbnail — left-click keeps loading the photo as always (see
+        photoActivated above); this is purely additive, the standard convention for a
+        context menu rather than repurposing the primary click."""
+        menu = QMenu(self)
+        delete_action = menu.addAction("Delete Photo…")
+        if menu.exec(btn.mapToGlobal(pos)) == delete_action:
+            self.photoDeleteRequested.emit(path)
+
+    def remove_photo(self, path):
+        """Removes a single thumbnail from the strip in place — used when a photo is
+        deleted from disk (DNGForge._delete_photo_from_filmstrip()), unlike set_photos()
+        which wipes and rebuilds the whole strip for a newly opened folder. A harmless
+        no-op if `path` isn't currently in the strip."""
+        btn = self._buttons.pop(path, None)
+        if btn is None:
+            return
+        self.strip_layout.removeWidget(btn)
+        btn.deleteLater()
+        self._thumb_pixmaps.pop(path, None)
+        self._statuses.pop(path, None)
+        if self._current_path == path:
+            self._current_path = None
+        if not self._buttons:
+            self.hide()
 
     def set_thumbnail(self, path, pixmap):
         """pixmap may be a null/empty QPixmap (no embedded preview found for that file, or
@@ -1508,8 +1556,61 @@ class FilmstripWidget(QWidget):
             return  # a stale result from an already-superseded folder scan — ignore
         if pixmap is None or pixmap.isNull():
             btn.setText(os.path.basename(path))
+            self._thumb_pixmaps.pop(path, None)
         else:
-            btn.setIcon(QIcon(pixmap))
+            self._thumb_pixmaps[path] = pixmap
+        self._refresh_icon(path)
+
+    def set_status(self, path, status):
+        """Sets the small edit-status badge drawn in the thumbnail's corner:
+        - "saved": this file's own saved XMP already carries edit tags, and there's
+          nothing pending beyond what's on disk right now — a green dot.
+        - "unsaved": there's an edit for this photo that isn't on disk yet (either it's
+          the currently open, dirtied photo, or it's sitting in DNGForge's own per-session
+          edit cache from switching away without saving) — a red dot.
+        - None: a pristine file with nothing to flag, or a path not part of the current
+          filmstrip (e.g. after opening a different folder) — a harmless no-op, not an
+          error, same convention set_thumbnail()/set_current() already use.
+        DNGForge is the sole source of truth for what these mean; this widget only ever
+        draws whatever it's told.
+        """
+        if path not in self._buttons:
+            return
+        if self._statuses.get(path) == status:
+            return  # avoid re-compositing an unchanged badge on every debounced settle
+        if status is None:
+            self._statuses.pop(path, None)
+        else:
+            self._statuses[path] = status
+        self._refresh_icon(path)
+
+    def _refresh_icon(self, path):
+        """(Re)composites path's badge (if any) onto its own plain thumbnail and sets it
+        as the button's icon — the single place both set_thumbnail() and set_status() funnel
+        through, so a status change after the thumbnail has already loaded (the common case —
+        status changes as the user edits, long after the initial folder scan) redraws from the
+        original pixmap rather than stacking badges on top of a previous badge."""
+        btn = self._buttons.get(path)
+        base = self._thumb_pixmaps.get(path)
+        if btn is None or base is None:
+            return  # no real pixmap yet (still scanning, or a filename-text fallback)
+        status = self._statuses.get(path)
+        if status is None:
+            btn.setIcon(QIcon(base))
+            return
+        badged = QPixmap(base)
+        painter = QPainter(badged)
+        painter.setRenderHint(QPainter.Antialiasing)
+        d = max(10, int(min(badged.width(), badged.height()) * 0.22))
+        margin = 3
+        x, y = badged.width() - d - margin, badged.height() - d - margin
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 170))  # dark halo so the dot reads on any thumbnail
+        painter.drawEllipse(x - 2, y - 2, d + 4, d + 4)
+        painter.setBrush(self.STATUS_COLORS[status])
+        painter.drawEllipse(x, y, d, d)
+        painter.end()
+        btn.setIcon(QIcon(badged))
 
     def set_current(self, path):
         """Highlights whichever thumbnail corresponds to the file currently open in the main
@@ -1524,6 +1625,13 @@ class FilmstripWidget(QWidget):
         if btn is not None:
             btn.setChecked(True)
             self.scroll.ensureWidgetVisible(btn)
+
+    def has_photo(self, path):
+        """Whether `path` is part of the currently-open folder's filmstrip — lets DNGForge
+        skip computing a status badge entirely (see _refresh_filmstrip_status()) when no
+        gallery is open, or the path in question isn't in it, without reaching into this
+        widget's own private button dict directly."""
+        return path in self._buttons
 
 
 class ImageLabel(QLabel):
@@ -2784,9 +2892,17 @@ class ThumbnailScanThread(QThread):
     pipeline's own generation counter already works — if the user opens a *second* folder
     before the first folder's scan finishes, the first scan's thumbnails should never land on
     the second folder's filmstrip.
+
+    Also determines, in one more batched exiftool call (JSON output this time, not `-w`),
+    whether each file already carries saved `-XMP-crs:*` edit tags — feeds the filmstrip's
+    "saved" status badge (see FilmstripWidget.set_status()). Reuses the exact same signal
+    read_xmp_crs_state() already relies on to tell "no data" apart from "a save where every
+    field happened to be 0": `WhiteBalance` is unconditionally written by every save, so its
+    presence alone is enough, no need to fetch (or care about) any other tag's value here.
     """
 
     thumbnail_ready = Signal(str, str, int)  # dng_path, extracted_thumb_jpeg_path (or ""), generation
+    saved_status_ready = Signal(dict, int)   # {dng_path: has_saved_edits}, generation
     finished_scan = Signal(int)              # generation
 
     def __init__(self, paths, exiftool_path, scratch_dir, generation, parent=None):
@@ -2806,6 +2922,27 @@ class ThumbnailScanThread(QThread):
                 thumb_path = os.path.join(self.scratch_dir, f"{stem}_thumb.jpg")
                 self.thumbnail_ready.emit(path, thumb_path if os.path.isfile(thumb_path) else "",
                                            self.generation)
+
+            status_args = [self.exiftool_path, "-j", "-n", "-G", "-XMP-crs:WhiteBalance"] + self.paths
+            result = subprocess.run(status_args, capture_output=True, timeout=180,
+                                     creationflags=_NO_WINDOW_FLAGS)
+            status_map = {}
+            try:
+                entries = json.loads(result.stdout.decode("utf-8", errors="replace"))
+            except Exception:
+                entries = []
+            # exiftool's own JSON always echoes "SourceFile" with forward slashes, even for a
+            # backslash path handed to it on Windows — normalize both sides before matching so
+            # the result lands back on the exact path string self.paths (and every other dict
+            # this app keys by path) actually uses.
+            norm_lookup = {os.path.normpath(p): p for p in self.paths}
+            for entry in entries:
+                src = entry.get("SourceFile")
+                if not src:
+                    continue
+                real_path = norm_lookup.get(os.path.normpath(src), src)
+                status_map[real_path] = entry.get("XMP:WhiteBalance") is not None
+            self.saved_status_ready.emit(status_map, self.generation)
         except Exception:
             pass
         finally:
@@ -3437,6 +3574,14 @@ class DNGForge(QMainWindow):
         # a file's own entry before reloading it — see that method — so an explicit revert
         # can't be silently undone by this cache handing the discarded state right back.
         self._session_edit_cache = {}
+        # Filmstrip status badges (FilmstripWidget.set_status()) — whether each photo in the
+        # current gallery already carries saved -XMP-crs:* edit tags on disk, keyed by path.
+        # Populated by the folder-wide scan (ThumbnailScanThread.saved_status_ready) and kept
+        # in sync by load_dng()/save_to_dng() for individual files as they're opened/saved.
+        # See _compute_filmstrip_status() for how this combines with _session_edit_cache
+        # (unsaved-this-session edits) and the currently-open photo's own live dirty state
+        # to decide each thumbnail's actual badge.
+        self._folder_saved_edit_status = {}
 
         self._default_preview_src_paths = {}  # generation -> disposable work.dng copy the
         # in-flight thread for that generation is writing tags onto — can't reuse
@@ -3517,13 +3662,13 @@ class DNGForge(QMainWindow):
         attempted, since the app genuinely cannot render anything without it.
         """
         QMessageBox.critical(
-            self, "Adobe DNG Converter non trovato",
-            "DNGForge richiede Adobe DNG Converter: è l'unico motore di rendering usato "
-            "dall'app, non esiste più un algoritmo interno di riserva.\n\n"
-            "Percorsi controllati:\n"
+            self, "Adobe DNG Converter Not Found",
+            "DNGForge requires Adobe DNG Converter: it's the only rendering engine this "
+            "app uses, there's no internal fallback algorithm anymore.\n\n"
+            "Paths checked:\n"
             r"C:\Program Files\Adobe\Adobe DNG Converter\Adobe DNG Converter.exe" "\n"
             r"C:\Program Files (x86)\Adobe\Adobe DNG Converter\Adobe DNG Converter.exe" "\n\n"
-            "Installalo (gratuito, da Adobe) e riavvia DNGForge."
+            "Install it (free, from Adobe) and restart DNGForge."
         )
 
     # ---- UI ----
@@ -3533,7 +3678,7 @@ class DNGForge(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.open_dng)
 
-        open_folder_action = QAction("Apri cartella…", self)
+        open_folder_action = QAction("Open Folder…", self)
         open_folder_action.setShortcut("Ctrl+Shift+O")
         open_folder_action.triggered.connect(self.open_folder)
 
@@ -3551,14 +3696,14 @@ class DNGForge(QMainWindow):
         # Close the currently open photo without quitting the app (distinct from Esci below)
         # — user-requested ("nel menu file vorrei un close (della foto) e un exit"), see
         # close_photo()'s own docstring.
-        close_photo_action = QAction("Chiudi foto", self)
+        close_photo_action = QAction("Close Photo", self)
         close_photo_action.setShortcut("Ctrl+W")
         close_photo_action.triggered.connect(self.close_photo)
 
         # Reuses self.close() → closeEvent(), so Esci gets the exact same unsaved-changes
         # confirmation the window's own × button/Alt+F4 already have, instead of duplicating
         # that logic here.
-        exit_action = QAction("Esci", self)
+        exit_action = QAction("Exit", self)
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
 
@@ -3581,11 +3726,11 @@ class DNGForge(QMainWindow):
         redo_action.setShortcut("Ctrl+Y")
         redo_action.triggered.connect(self.redo)
 
-        copy_settings_action = QAction("Copia impostazioni", self)
+        copy_settings_action = QAction("Copy Settings", self)
         copy_settings_action.setShortcut("Ctrl+Alt+C")  # same shortcut real Lightroom uses
         copy_settings_action.triggered.connect(self.copy_settings)
 
-        self.paste_settings_action = QAction("Incolla impostazioni", self)
+        self.paste_settings_action = QAction("Paste Settings", self)
         self.paste_settings_action.setShortcut("Ctrl+Alt+V")  # ditto
         self.paste_settings_action.triggered.connect(self.paste_settings)
         self.paste_settings_action.setEnabled(False)  # nothing copied yet this session
@@ -3620,7 +3765,7 @@ class DNGForge(QMainWindow):
         view_menu.addAction(zoom_100_action)
 
     def _build_ui(self):
-        self.image_label = ImageLabel("Apri un file DNG (File → Open DNG…)")
+        self.image_label = ImageLabel("Open a DNG file (File → Open DNG…)")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setMinimumSize(200, 200)
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -3673,8 +3818,8 @@ class DNGForge(QMainWindow):
         self.default_preview_btn = QPushButton("👁 Default")
         self.default_preview_btn.setCheckable(True)
         self.default_preview_btn.setToolTip(
-            "Mostra l'anteprima con tutti i controlli ai valori di default "
-            "(crop/raddrizzamento esclusi, restano quelli attuali) — on/off"
+            "Shows the preview with every control at its default value "
+            "(crop/straighten excluded, kept as-is) — on/off"
         )
         self.default_preview_btn.clicked.connect(self._toggle_default_preview)
         zoom_bar.addWidget(self.default_preview_btn)
@@ -3685,20 +3830,20 @@ class DNGForge(QMainWindow):
         # combined dump was conflating two questions ("what did I edit" vs "what does the camera
         # say about this shot") into one. See _show_xmp_info()/_show_exif_info().
         self.info_xmp_btn = QPushButton("ⓘ XMP")
-        self.info_xmp_btn.setToolTip("Mostra i tag -XMP-crs:* (la 'ricetta' di editing) salvati nel file")
+        self.info_xmp_btn.setToolTip("Shows the -XMP-crs:* tags (the editing 'recipe') saved in the file")
         self.info_xmp_btn.clicked.connect(self._show_xmp_info)
         zoom_bar.addWidget(self.info_xmp_btn)
         self.info_exif_btn = QPushButton("ⓘ EXIF")
         self.info_exif_btn.setToolTip(
-            "Mostra i tag EXIF (calibrazione/cattura della fotocamera: ColorMatrix, "
-            "AsShotNeutral, Make/Model/Lens, ...) salvati nel file"
+            "Shows the EXIF tags (camera capture/calibration data: ColorMatrix, "
+            "AsShotNeutral, Make/Model/Lens, ...) saved in the file"
         )
         self.info_exif_btn.clicked.connect(self._show_exif_info)
         zoom_bar.addWidget(self.info_exif_btn)
         self.info_metadata_btn = QPushButton("ⓘ Metadata")
         self.info_metadata_btn.setToolTip(
-            "Mostra i campi metadata di sola lettura (dimensioni, esposizione, ISO, "
-            "fotocamera/obiettivo, ...) — ex-pannello 'Metadata' della sidebar"
+            "Shows the read-only metadata fields (dimensions, exposure, ISO, "
+            "camera/lens, ...) — formerly the sidebar's own 'Metadata' panel"
         )
         self.info_metadata_btn.clicked.connect(self._show_metadata_info)
         zoom_bar.addWidget(self.info_metadata_btn)
@@ -3733,10 +3878,11 @@ class DNGForge(QMainWindow):
         central_layout.addWidget(splitter, 1)
         self.filmstrip = FilmstripWidget()
         self.filmstrip.photoActivated.connect(self.load_dng)
+        self.filmstrip.photoDeleteRequested.connect(self._delete_photo_from_filmstrip)
         central_layout.addWidget(self.filmstrip)
 
         self.setCentralWidget(central)
-        self.statusBar().showMessage("Pronto")
+        self.statusBar().showMessage("Ready")
 
     def _build_controls(self):
         """Panel structure mirrors real Lightroom's actual Develop-panel boundaries — user-
@@ -4387,7 +4533,7 @@ class DNGForge(QMainWindow):
         self._wb_picker_armed = checked
         self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
         self.statusBar().showMessage(
-            "Clicca su un'area neutra (grigia/bianca) dell'immagine…" if checked else "Pronto"
+            "Click a neutral (gray/white) area of the image…" if checked else "Ready"
         )
 
     def _on_image_clicked(self, x_frac, y_frac):
@@ -4409,7 +4555,7 @@ class DNGForge(QMainWindow):
         try:
             neutral = sample_raw_neutral(self.raw_path, x_frac, y_frac)
         except ValueError as e:
-            QMessageBox.warning(self, "Bilanciamento del bianco", str(e))
+            QMessageBox.warning(self, "White Balance", str(e))
             return
 
         if self.camera_profile is not None:
@@ -4427,7 +4573,7 @@ class DNGForge(QMainWindow):
         self.temp_slider.set_value(temp)
         self.tint_slider.set_value(tint)
         self._schedule_update()
-        self.statusBar().showMessage(f"Bilanciamento del bianco impostato dal click: {temp:.0f}K, tint {tint:.0f}")
+        self.statusBar().showMessage(f"White balance set from click: {temp:.0f}K, tint {tint:.0f}")
 
     def _toggle_radial_picker(self, checked):
         if self.raw is None:
@@ -4435,7 +4581,7 @@ class DNGForge(QMainWindow):
             return
         self._radial_picker_armed = checked
         self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
-        self.statusBar().showMessage("Clicca sull'immagine per posizionare un nuovo filtro radiale…" if checked else "Pronto")
+        self.statusBar().showMessage("Click the image to place a new radial filter…" if checked else "Ready")
 
     def _place_radial_filter(self, x_frac, y_frac):
         """Adds a new radial filter region — does NOT replace existing ones (multi-region,
@@ -4487,7 +4633,7 @@ class DNGForge(QMainWindow):
         self.radial_show_check.blockSignals(False)
         self._update_radial_overlay()
         n = len(self.radial_filters)
-        self.statusBar().showMessage(f"Filtro radiale {index + 1} di {n} selezionato")
+        self.statusBar().showMessage(f"Radial filter {index + 1} of {n} selected")
 
     def _clear_radial_filter(self):
         """Removes the *selected* filter only — others, if any, stay in place."""
@@ -4563,7 +4709,7 @@ class DNGForge(QMainWindow):
         self._gradient_picker_armed = checked
         self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
         self.statusBar().showMessage(
-            "Clicca sull'immagine per posizionare un nuovo filtro graduato…" if checked else "Pronto"
+            "Click the image to place a new graduated filter…" if checked else "Ready"
         )
 
     def _place_gradient_filter(self, x_frac, y_frac):
@@ -4613,7 +4759,7 @@ class DNGForge(QMainWindow):
         self.gradient_show_check.blockSignals(False)
         self._update_gradient_overlay()
         n = len(self.gradient_filters)
-        self.statusBar().showMessage(f"Filtro graduato {index + 1} di {n} selezionato")
+        self.statusBar().showMessage(f"Graduated filter {index + 1} of {n} selected")
 
     def _clear_gradient_filter(self):
         """Removes the *selected* filter only — others, if any, stay in place."""
@@ -4679,7 +4825,7 @@ class DNGForge(QMainWindow):
         self._spot_picker_armed = checked
         self.image_label.setCursor(Qt.CrossCursor if checked else Qt.ArrowCursor)
         self.statusBar().showMessage(
-            "Clicca sulla macchia da rimuovere…" if checked else "Pronto"
+            "Click the spot to remove…" if checked else "Ready"
         )
 
     def _place_spot(self, x_frac, y_frac):
@@ -4730,7 +4876,7 @@ class DNGForge(QMainWindow):
         self.spot_show_check.blockSignals(False)
         self._update_spot_overlay()
         n = len(self.spots)
-        self.statusBar().showMessage(f"Macchia {index + 1} di {n} selezionata")
+        self.statusBar().showMessage(f"Spot {index + 1} of {n} selected")
 
     def _clear_spot(self):
         """Removes the *selected* spot only — others, if any, stay in place."""
@@ -4843,18 +4989,27 @@ class DNGForge(QMainWindow):
         if ratio == "original":
             ratio = self.raw.sizes.width / self.raw.sizes.height
         self._apply_crop_aspect_ratio(ratio)
+        if not self._crop_editing:
+            self._schedule_update()
 
     def _apply_crop_aspect_ratio(self, ratio):
         """ratio is a target output width/height in *pixels*, or None for freeform.
         Reshapes the current rectangle to that ratio (centered, shrunk to fit within its
         own current bounding box) and arms ImageLabel's corner-drag constraint to keep
         matching it afterward.
+
+        Purely a geometry change on self.crop's own rectangle — never schedules a render
+        itself (see _on_crop_dragged() below for why rectangle-only changes don't need
+        one while editing). Callers decide whether a render is actually warranted: the
+        aspect combo (_on_crop_aspect_changed()) only needs one while NOT editing (once
+        editing, this is just a reshape of the same full-frame guide); the
+        rotation-driven reshape (_on_crop_rotation_changed()) always needs one, since the
+        rotation itself changed what's rendered, regardless of this reshape.
         """
         w, h = self.raw.sizes.width, self.raw.sizes.height
         if ratio is None:
             self.image_label.crop_aspect = None
             self._update_crop_overlay()
-            self._schedule_update()
             return
 
         frac_ratio = ratio * h / w  # target (right-left)/(bottom-top) in fraction space
@@ -4872,7 +5027,6 @@ class DNGForge(QMainWindow):
         c["left"], c["right"] = left, left + new_w
         c["top"], c["bottom"] = top, top + new_h
         self._update_crop_overlay()
-        self._schedule_update()
 
     def _on_crop_rotation_changed(self):
         if self.crop is None or self.raw is None:
@@ -4888,16 +5042,35 @@ class DNGForge(QMainWindow):
                 ratio = self.raw.sizes.width / self.raw.sizes.height
             if ratio:
                 self._apply_crop_aspect_ratio(ratio)
-                return  # already schedules update / overlay refresh
+                # The reshape above is a pure geometry change and schedules nothing on
+                # its own — but the rotation that triggered it always needs a fresh
+                # render, since angle (unlike rectangle position) does affect what's
+                # shown while editing (see _effective_crop_for_render()).
+                self._schedule_update()
+                return
         self._update_crop_overlay()
         self._schedule_update()
 
     def _on_crop_dragged(self, geom):
+        """Live geometry updates from dragging a crop-rectangle handle (ImageLabel emits
+        this on every mouse move during a drag, not just on release).
+
+        Deliberately does NOT call _schedule_update() while the crop guide is being
+        edited: _effective_crop_for_render() shows the *full* straightened frame during
+        editing regardless of where this rectangle sits (see that method) — only the
+        overlay's on-screen position depends on left/top/right/bottom while editing, and
+        ImageLabel already repaints that overlay itself as it drags, from the same dict
+        this mutates. Re-rendering here would ask Adobe DNG Converter for a byte-identical
+        image on every drag/release, for no visible change — wasted work, and a spinner
+        that spins for nothing. The real crop is applied (and rendered) once editing is
+        committed, via _toggle_crop_enable() unchecking the guide.
+        """
         if self.crop is None:
             return
         self.crop.update({"left": geom["left"], "top": geom["top"],
                            "right": geom["right"], "bottom": geom["bottom"]})
-        self._schedule_update()
+        if not self._crop_editing:
+            self._schedule_update()
 
     def _update_crop_overlay(self):
         if self.crop is not None and self._crop_editing:
@@ -5034,31 +5207,43 @@ class DNGForge(QMainWindow):
     # ---- File I/O ----
 
     def open_dng(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Apri DNG", "", "DNG files (*.dng);;Tutti i file (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open DNG", "", "DNG files (*.dng);;All files (*.*)")
         if path:
-            self.load_dng(path)
+            # Qt's own file dialogs always return forward-slash paths, even on Windows — left
+            # as-is, later mixing with a backslash-joined path (see open_folder()'s own comment
+            # on this) can break Windows APIs that require a fully-normalized path, like
+            # send2trash's use of the \\?\ long-path prefix (see "Delete photo from disk" in
+            # CLAUDE.md for the confirmed crash this caused). Normalize once, right at the source.
+            self.load_dng(os.path.normpath(path))
 
     def open_folder(self):
-        """File → Apri cartella… (Ctrl+Shift+O): scans a folder for .dng files and populates
+        """File → Open Folder… (Ctrl+Shift+O): scans a folder for .dng files and populates
         the filmstrip (FilmstripWidget) — a disposable, per-session gallery, not a persistent
         catalog (see that class's own docstring for why). Thumbnails themselves are filled in
         asynchronously by ThumbnailScanThread so a folder with many files doesn't freeze the UI
         while exiftool works through it.
         """
-        folder = QFileDialog.getExistingDirectory(self, "Apri cartella")
+        folder = QFileDialog.getExistingDirectory(self, "Open Folder")
         if not folder:
             return
+        # Same normalization as open_dng() — Qt returns "C:/Users/.../folder", which os.path.join()
+        # would then mix with backslash-joined filenames below, producing mixed-separator paths
+        # that break send2trash()'s Windows long-path handling (see "Delete photo from disk" in
+        # CLAUDE.md). Normalizing here, once, means every path derived from `folder` (self.paths,
+        # every dict this app keys by path) is a clean, consistent Windows path from the start.
+        folder = os.path.normpath(folder)
         try:
             names = os.listdir(folder)
         except OSError as e:
-            QMessageBox.critical(self, "Apertura cartella non riuscita", str(e))
+            QMessageBox.critical(self, "Failed to Open Folder", str(e))
             return
         paths = sorted(
             os.path.join(folder, n) for n in names if os.path.splitext(n)[1].lower() == ".dng"
         )
         self.filmstrip.set_photos(paths)
+        self._folder_saved_edit_status = {}  # stale from any previously-open folder
         if not paths:
-            self.statusBar().showMessage(f"Nessun file .dng trovato in {os.path.basename(folder)}")
+            self.statusBar().showMessage(f"No .dng files found in {os.path.basename(folder)}")
             return
 
         self._gallery_generation += 1
@@ -5067,9 +5252,10 @@ class DNGForge(QMainWindow):
         self._thumbnail_scan_dirs[generation] = scratch
         self._thumbnail_thread = ThumbnailScanThread(paths, self.exiftool_path, scratch, generation, parent=self)
         self._thumbnail_thread.thumbnail_ready.connect(self._on_thumbnail_ready)
+        self._thumbnail_thread.saved_status_ready.connect(self._on_folder_saved_status_ready)
         self._thumbnail_thread.finished_scan.connect(self._on_thumbnail_scan_finished)
         self._thumbnail_thread.start()
-        self.statusBar().showMessage(f"{len(paths)} file .dng trovati in {os.path.basename(folder)} — caricamento anteprime…")
+        self.statusBar().showMessage(f"{len(paths)} .dng file(s) found in {os.path.basename(folder)} — loading previews…")
 
     def _on_thumbnail_ready(self, dng_path, thumb_path, generation):
         if generation != self._gallery_generation:
@@ -5090,9 +5276,48 @@ class DNGForge(QMainWindow):
                 pass
         self.filmstrip.set_thumbnail(dng_path, pix)
 
+    def _on_folder_saved_status_ready(self, status_map, generation):
+        if generation != self._gallery_generation:
+            return  # a stale result from a folder scan the user has since replaced
+        for path, has_saved_edits in status_map.items():
+            self._folder_saved_edit_status[path] = has_saved_edits
+            self._refresh_filmstrip_status(path)
+
+    def _compute_filmstrip_status(self, path):
+        """Single source of truth for what badge (see FilmstripWidget.set_status()) a given
+        photo in the current gallery should show, combining three independent signals:
+        - self._session_edit_cache: a real unsaved edit left behind after switching away
+          from `path` without saving (see that dict's own __init__ comment) — only ever
+          populated when the outgoing state actually differs from what was on disk, see
+          load_dng()'s own caching step, so its mere presence already means "unsaved".
+        - the *currently open* photo's own live dirty state — not reflected in the cache
+          above until the user actually navigates away from it (see load_dng()), so it
+          needs its own direct comparison against self._saved_edit_state here.
+        - self._folder_saved_edit_status: whether `path` already carries saved
+          -XMP-crs:* edit tags on disk at all, from the initial folder-wide scan (or
+          updated directly by load_dng()/save_to_dng() for files actually touched).
+        "unsaved" always wins over "saved": a previously-saved photo that's been edited
+        again since is not accurately described as merely "saved" anymore.
+        """
+        if path in self._session_edit_cache:
+            return "unsaved"
+        if path == self.raw_path and self.raw is not None:
+            if self._capture_edit_state() != self._saved_edit_state:
+                return "unsaved"
+        if self._folder_saved_edit_status.get(path):
+            return "saved"
+        return None
+
+    def _refresh_filmstrip_status(self, path):
+        """Recomputes and applies path's filmstrip badge — a cheap no-op (no
+        _capture_edit_state() deep-copy at all) when no gallery is open or `path` isn't
+        part of it, via FilmstripWidget.has_photo()."""
+        if path and self.filmstrip.has_photo(path):
+            self.filmstrip.set_status(path, self._compute_filmstrip_status(path))
+
     def _on_thumbnail_scan_finished(self, generation):
         if generation == self._gallery_generation:
-            self.statusBar().showMessage("Anteprime caricate")
+            self.statusBar().showMessage("Previews loaded")
         # Each generation's own scratch dir is tracked independently (not a single shared
         # attribute) precisely so that opening a *second* folder while an earlier scan is
         # still running can't lose track of the earlier one's directory — every generation
@@ -5118,13 +5343,22 @@ class DNGForge(QMainWindow):
         # Skipped on a same-path reload (revert_to_saved() calling load_dng(self.raw_path)
         # again) — revert_to_saved() itself clears that path's entry instead, since re-caching
         # the about-to-be-discarded state here would just silently undo the revert.
+        # Only actually cached when it *differs* from what's on disk (self._saved_edit_state,
+        # still the outgoing file's own baseline at this point) — an unedited (or edited-then-
+        # undone-back-to-saved) photo has nothing worth preserving, and caching it anyway
+        # would wrongly flag it "unsaved" in the filmstrip (see _compute_filmstrip_status()).
         if self.raw_path is not None and self.raw_path != path:
-            self._session_edit_cache[self.raw_path] = self._capture_edit_state()
+            outgoing_state = self._capture_edit_state()
+            if outgoing_state != self._saved_edit_state:
+                self._session_edit_cache[self.raw_path] = outgoing_state
+            else:
+                self._session_edit_cache.pop(self.raw_path, None)
+            self._refresh_filmstrip_status(self.raw_path)
 
         if self.raw is not None:
             self.raw.close()
 
-        self.statusBar().showMessage(f"Apertura di {os.path.basename(path)}…")
+        self.statusBar().showMessage(f"Opening {os.path.basename(path)}…")
         QApplication.processEvents()
 
         t0 = time.time()
@@ -5147,6 +5381,7 @@ class DNGForge(QMainWindow):
         self.setWindowTitle(f"DNGForge — {os.path.basename(path)}")
         self.reset_controls()
         xmp_state = read_xmp_crs_state(self.exiftool_path, path, tags=combined_tags)
+        self._folder_saved_edit_status[path] = xmp_state is not None
         if xmp_state:
             self._apply_xmp_crs_state(xmp_state)
         self.radial_filters = read_radial_filters(self.exiftool_path, path, tags=combined_tags)
@@ -5181,24 +5416,24 @@ class DNGForge(QMainWindow):
             # function comment for why this exists and revert_to_saved() for the one path
             # that deliberately bypasses it
         self._render_preview()
-        colorimetry = "colorimetria DNG attiva" if self.camera_profile else "colorimetria approssimata (ColorMatrix non disponibile)"
+        colorimetry = "real DNG colorimetry" if self.camera_profile else "approximate colorimetry (ColorMatrix not available)"
         restored_bits = []
         if xmp_state:
             restored_bits.append("editing")
         if self.radial_filters:
-            restored_bits.append(f"{len(self.radial_filters)} filtro/i radiale/i")
+            restored_bits.append(f"{len(self.radial_filters)} radial filter(s)")
         if self.gradient_filters:
-            restored_bits.append(f"{len(self.gradient_filters)} filtro/i graduato/i")
+            restored_bits.append(f"{len(self.gradient_filters)} graduated filter(s)")
         if self.spots:
-            restored_bits.append(f"{len(self.spots)} macchia/e rimossa/e")
+            restored_bits.append(f"{len(self.spots)} spot(s) removed")
         if self.crop:
             restored_bits.append("crop")
-        edit_state = f" — {' e '.join(restored_bits)} ripristinato/i" if restored_bits else ""
+        edit_state = f" — {' and '.join(restored_bits)} restored" if restored_bits else ""
         if restored_from_session:
-            edit_state += " — modifiche non salvate di questa sessione ripristinate"
+            edit_state += " — unsaved changes from this session restored"
         self.statusBar().showMessage(
             f"{os.path.basename(path)} — {self.raw.sizes.width}x{self.raw.sizes.height} "
-            f"(caricato in {time.time() - t0:.2f}s, {colorimetry}){edit_state}"
+            f"(loaded in {time.time() - t0:.2f}s, {colorimetry}){edit_state}"
         )
 
     def _update_metadata_panel(self, path):
@@ -5228,10 +5463,10 @@ class DNGForge(QMainWindow):
         list every other read in this app already keys off) alongside the wildcard.
         """
         self._show_tag_info_dialog(
-            "Tag XMP-crs (editing)",
+            "XMP-crs Tags (editing)",
             ["-struct", "-XMP-crs:all"] + [f"-XMP-crs:{t}" for t in XMP_CRS_TAGS],
-            "(nessun tag -XMP-crs:* trovato in questo file — probabilmente un file mai "
-            "modificato da Lightroom/Camera Raw/DNGForge, vedi CLAUDE.md 'Virgin-file defaults')",
+            "(no -XMP-crs:* tags found in this file — likely a file never edited by "
+            "Lightroom/Camera Raw/DNGForge, see CLAUDE.md 'Virgin-file defaults')",
         )
 
     def _show_exif_info(self):
@@ -5245,8 +5480,8 @@ class DNGForge(QMainWindow):
         Avoid-flag omission here), so no explicit-tag-list workaround is needed.
         """
         self._show_tag_info_dialog(
-            "Tag EXIF (fotocamera)", ["-EXIF:all"],
-            "(nessun tag EXIF trovato in questo file)",
+            "EXIF Tags (camera)", ["-EXIF:all"],
+            "(no EXIF tags found in this file)",
         )
 
     def _show_metadata_info(self):
@@ -5275,7 +5510,7 @@ class DNGForge(QMainWindow):
         if self.raw_path is None:
             return
         if not self.exiftool_path:
-            QMessageBox.critical(self, title, "exiftool non trovato: impossibile leggere i tag.")
+            QMessageBox.critical(self, title, "exiftool not found: unable to read the tags.")
             return
         try:
             result = subprocess.run(
@@ -5283,7 +5518,7 @@ class DNGForge(QMainWindow):
                 capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW_FLAGS,
             )
         except Exception as e:
-            QMessageBox.critical(self, title, f"Lettura exiftool non riuscita: {e}")
+            QMessageBox.critical(self, title, f"exiftool read failed: {e}")
             return
         text = result.stdout.strip() or empty_message
         if result.stderr.strip():
@@ -5306,9 +5541,9 @@ class DNGForge(QMainWindow):
         layout.addWidget(editor)
 
         button_row = QHBoxLayout()
-        copy_btn = QPushButton("Copia negli appunti")
+        copy_btn = QPushButton("Copy to Clipboard")
         copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(text))
-        close_btn = QPushButton("Chiudi")
+        close_btn = QPushButton("Close")
         close_btn.clicked.connect(dialog.accept)
         button_row.addWidget(copy_btn)
         button_row.addStretch(1)
@@ -5671,6 +5906,9 @@ class DNGForge(QMainWindow):
         if self.raw is None:
             return
         self._maybe_push_undo_state()
+        self._refresh_filmstrip_status(self.raw_path)  # keep the current photo's own
+        # filmstrip badge live as the user edits, not just on load/save/revert — a cheap
+        # no-op when no gallery is open (see that method)
         self._schedule_dngconv_render()
         self._schedule_zoom_detail_render()  # keep the zoomed-in detail patch, if any, in
         # sync with edit changes too — not just zoom/pan (see "Zoom detail rendering" below)
@@ -5845,7 +6083,7 @@ class DNGForge(QMainWindow):
         # comes from a real Adobe render). The status bar note plus the spinner overlay
         # (RethinkRAW-style dotted circle, centered on the image, see _sync_spinner()) are
         # the only feedback that anything is happening.
-        self.statusBar().showMessage("Rendering anteprima Adobe DNG Converter…")
+        self.statusBar().showMessage("Rendering Adobe DNG Converter preview…")
         self._sync_spinner()
 
     def _on_dngconv_render_ready(self, jpeg_path, generation):
@@ -5856,7 +6094,7 @@ class DNGForge(QMainWindow):
                     self._preview_pixmap = pixmap
                     self._update_image_label()
                     self.histogram_widget.set_data(compute_rgb_histogram(jpeg_path))
-                    self.statusBar().showMessage("Anteprima Adobe DNG Converter aggiornata", 3000)
+                    self.statusBar().showMessage("Adobe DNG Converter preview updated", 3000)
         finally:
             if os.path.exists(jpeg_path):
                 try:
@@ -5879,7 +6117,7 @@ class DNGForge(QMainWindow):
             # yet on a freshly opened file) is left untouched — a failed background render
             # is not a reason to replace a valid image with nothing, or an internal
             # approximation this app doesn't have.
-            self.statusBar().showMessage("Rendering Adobe DNG Converter non riuscito — anteprima invariata", 4000)
+            self.statusBar().showMessage("Adobe DNG Converter render failed — preview unchanged", 4000)
         self._sync_spinner()
 
     # ---- Default Preview toggle ----
@@ -5893,7 +6131,7 @@ class DNGForge(QMainWindow):
             self._default_preview_active = False
             self._default_preview_pixmap = None
             self._update_image_label()
-            self.statusBar().showMessage("Anteprima default disattivata", 2000)
+            self.statusBar().showMessage("Default preview off", 2000)
             return
 
         if self.raw is None or not self._work_dng_path or not os.path.isfile(self._work_dng_path):
@@ -5941,7 +6179,7 @@ class DNGForge(QMainWindow):
         self._default_preview_thread.ready.connect(self._on_default_preview_ready)
         self._default_preview_thread.failed.connect(self._on_default_preview_failed)
         self._default_preview_thread.start()
-        self.statusBar().showMessage("Rendering anteprima default…")
+        self.statusBar().showMessage("Rendering default preview…")
         self._sync_spinner()
 
     def _on_default_preview_ready(self, jpeg_path, generation):
@@ -5952,7 +6190,7 @@ class DNGForge(QMainWindow):
                 if not pixmap.isNull():
                     self._default_preview_pixmap = pixmap
                     self._update_image_label()
-                    self.statusBar().showMessage("Anteprima default pronta", 3000)
+                    self.statusBar().showMessage("Default preview ready", 3000)
         finally:
             if os.path.exists(jpeg_path):
                 try:
@@ -5977,7 +6215,7 @@ class DNGForge(QMainWindow):
             except OSError:
                 pass
         if generation == self._default_preview_generation and self._default_preview_active:
-            self.statusBar().showMessage("Rendering anteprima default non riuscito", 4000)
+            self.statusBar().showMessage("Default preview render failed", 4000)
             self.default_preview_btn.setChecked(False)
             self._default_preview_active = False
         self._sync_spinner()
@@ -6147,7 +6385,7 @@ class DNGForge(QMainWindow):
         self._zoom_detail_thread.ready.connect(self._on_zoom_detail_render_ready)
         self._zoom_detail_thread.failed.connect(self._on_zoom_detail_render_failed)
         self._zoom_detail_thread.start()
-        self.statusBar().showMessage("Rendering dettaglio zoom…")
+        self.statusBar().showMessage("Rendering zoom detail…")
         self._sync_spinner()
 
     def _on_zoom_detail_render_ready(self, jpeg_path, generation):
@@ -6181,10 +6419,10 @@ class DNGForge(QMainWindow):
                         # digitalmente") — describes the *current* level, not a warning about
                         # zooming further (the user's own correction: not "ulteriore zoom sarà
                         # digitale" but "lo zoom a questo livello è già solo digitale").
-                        note = (" — a questo livello lo zoom è solo digitale (nessun dettaglio nativo in più)"
+                        note = (" — at this level zoom is purely digital (no extra native detail)"
                                 if self._pending_zoom_detail_native_capped else "")
                         self.statusBar().showMessage(
-                            f"Dettaglio zoom: {cropped.width()}×{cropped.height()}px{note}", 5000
+                            f"Zoom detail: {cropped.width()}×{cropped.height()}px{note}", 5000
                         )
         finally:
             if os.path.exists(jpeg_path):
@@ -6206,7 +6444,7 @@ class DNGForge(QMainWindow):
             if region is not None:
                 self._start_zoom_detail_render(region)
         elif generation == self._zoom_detail_generation:
-            self.statusBar().showMessage("Rendering dettaglio zoom non riuscito", 4000)
+            self.statusBar().showMessage("Zoom detail render failed", 4000)
         # Otherwise: leave whatever's currently displayed (plain preview, or a still-valid
         # older detail patch) untouched — same "a failed background render is not a reason
         # to replace a valid image" convention the main pipeline already follows.
@@ -6426,17 +6664,17 @@ class DNGForge(QMainWindow):
 
     def undo(self):
         if not self._undo_stack:
-            self.statusBar().showMessage("Niente da annullare")
+            self.statusBar().showMessage("Nothing to undo")
             return
         self._redo_stack.append(self._current_edit_state)
         prev_state = self._undo_stack.pop()
         self._apply_edit_state(prev_state)
         self._current_edit_state = prev_state
-        self.statusBar().showMessage(f"Annullato ({len(self._undo_stack)} passo/i ancora disponibile/i)")
+        self.statusBar().showMessage(f"Undone ({len(self._undo_stack)} step(s) still available)")
 
     def redo(self):
         if not self._redo_stack:
-            self.statusBar().showMessage("Niente da ripetere")
+            self.statusBar().showMessage("Nothing to redo")
             return
         self._undo_stack.append(self._current_edit_state)
         if len(self._undo_stack) > self.UNDO_STACK_MAX:
@@ -6444,7 +6682,7 @@ class DNGForge(QMainWindow):
         next_state = self._redo_stack.pop()
         self._apply_edit_state(next_state)
         self._current_edit_state = next_state
-        self.statusBar().showMessage(f"Ripetuto ({len(self._redo_stack)} passo/i ancora disponibile/i)")
+        self.statusBar().showMessage(f"Redone ({len(self._redo_stack)} step(s) still available)")
 
     def copy_settings(self):
         """Edit → Copia impostazioni (Ctrl+Alt+C) — snapshots the *entire* current edit state
@@ -6462,7 +6700,7 @@ class DNGForge(QMainWindow):
             return
         self._settings_clipboard = self._capture_edit_state()
         self.paste_settings_action.setEnabled(True)
-        self.statusBar().showMessage("Impostazioni copiate")
+        self.statusBar().showMessage("Settings copied")
 
     def paste_settings(self):
         """Edit → Incolla impostazioni (Ctrl+Alt+V) — applies the clipboard snapshot to
@@ -6478,7 +6716,7 @@ class DNGForge(QMainWindow):
         if self.raw is None or self._settings_clipboard is None:
             return
         self._apply_edit_state(self._settings_clipboard)
-        self.statusBar().showMessage("Impostazioni incollate")
+        self.statusBar().showMessage("Settings pasted")
 
     def revert_to_saved(self):
         """Discards every in-session change (including the undo/redo history — a fresh
@@ -6489,7 +6727,7 @@ class DNGForge(QMainWindow):
             return
         reply = QMessageBox.question(
             self, "Revert to Last Save",
-            "Scartare tutte le modifiche non salvate e ricaricare il file dall'ultimo salvataggio?",
+            "Discard all unsaved changes and reload the file from its last save?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
@@ -6519,9 +6757,9 @@ class DNGForge(QMainWindow):
         dirty = self._saved_edit_state is not None and self._capture_edit_state() != self._saved_edit_state
         if dirty:
             reply = QMessageBox.question(
-                self, "Modifiche non salvate",
-                f"'{os.path.basename(self.raw_path)}' ha modifiche non salvate.\n\n"
-                "Salvare prima di chiudere?",
+                self, "Unsaved Changes",
+                f"'{os.path.basename(self.raw_path)}' has unsaved changes.\n\n"
+                "Save before closing?",
                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
                 QMessageBox.Save,
             )
@@ -6533,10 +6771,25 @@ class DNGForge(QMainWindow):
                     # don't also close and lose the file on top of a failed save.
                     return
 
-        # Whether saved or discarded (Save/Discard both fall through to here), this file's
-        # session-cache entry must go too — leaving a Discard-ed edit cached would silently
-        # hand it right back if the same file is reopened later this session (see
-        # _session_edit_cache's own __init__ comment). A harmless no-op if nothing was cached.
+        self._unload_current_photo()
+        self.statusBar().showMessage("Photo closed")
+
+    def _unload_current_photo(self):
+        """The actual 'forget this file, return to startup state' work — factored out of
+        close_photo() so the filmstrip's 'Elimina foto…' action (see
+        _delete_photo_from_filmstrip()) can reuse it too: deleting a file obviously
+        discards anything unsaved for it, the same end state as close_photo()'s own
+        Discard path, just reached without that path's Save/Don't Save/Cancel prompt
+        (whatever confirmation deletion itself needs is that caller's own concern, not
+        this shared unload step's). A no-op when nothing is open.
+        """
+        if self.raw is None:
+            return
+        # Whether saved, discarded, or about to be deleted, this file's session-cache
+        # entry must go too — leaving one behind would silently hand it right back if the
+        # same path is ever reloaded again this session (see _session_edit_cache's own
+        # __init__ comment). A harmless no-op if nothing was cached.
+        closed_path = self.raw_path
         self._session_edit_cache.pop(self.raw_path, None)
 
         # Same generation-bump-and-queue-for-later-cleanup _reset_dngconv_pipeline() does when
@@ -6566,6 +6819,12 @@ class DNGForge(QMainWindow):
         self.raw = None
         self.raw_path = None
         self.filmstrip.set_current(None)
+        # Refreshed only now that self.raw/self.raw_path are actually cleared — computing
+        # this any earlier would still see the about-to-be-discarded live edit state (the
+        # sliders themselves aren't reset until reset_controls() below), incorrectly
+        # reporting "unsaved" for a Discard that's already happened. A harmless no-op when
+        # the caller is about to delete this same path from the filmstrip entirely anyway.
+        self._refresh_filmstrip_status(closed_path)
         self.camera_profile = None
         self.camera_wb = None
         self.metadata_values = {}
@@ -6579,7 +6838,7 @@ class DNGForge(QMainWindow):
         self.histogram_widget.clear_data()
         self.image_label.stop_spinner()
         self.image_label.clear()
-        self.image_label.setText("Apri un file DNG (File → Open DNG…)")
+        self.image_label.setText("Open a DNG file (File → Open DNG…)")
         # Sliders/filters/crop back to virgin-file defaults, and every overlay along with them
         # (reset_controls() already sets radial_filters/gradient_filters/spots/crop to their
         # empty/None state and re-selects index -1 on each, which clears the corresponding
@@ -6589,7 +6848,43 @@ class DNGForge(QMainWindow):
         self.reset_controls()
         self._set_zoom_level(None)
         self.setWindowTitle("DNGForge")
-        self.statusBar().showMessage("Foto chiusa")
+
+    def _delete_photo_from_filmstrip(self, path):
+        """Right-click → 'Elimina foto…' on a filmstrip thumbnail (FilmstripWidget's own
+        context menu — see that class). Moves the file to the Recycle Bin via
+        `send2trash`, the same recoverable-by-default behavior as Explorer's own Delete
+        key, rather than a permanent os.remove() a single mis-click could never undo —
+        user-requested specifically for this reason.
+
+        If `path` is the currently open photo, it's unloaded first (_unload_current_photo(),
+        no Save/Discard prompt of its own — deleting the file makes any unsaved edit for it
+        moot regardless) so its rawpy handle releases the OS file lock before send2trash()
+        tries to move it; Windows refuses to move/delete a file that's still open.
+        """
+        reply = QMessageBox.question(
+            self, "Delete Photo",
+            f"Move '{os.path.basename(path)}' to the Recycle Bin?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if not HAVE_SEND2TRASH:
+            QMessageBox.critical(
+                self, "Delete Failed",
+                "The 'send2trash' library isn't installed (pip install send2trash).",
+            )
+            return
+        if path == self.raw_path:
+            self._unload_current_photo()
+        try:
+            send2trash.send2trash(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Failed", str(e))
+            return
+        self._session_edit_cache.pop(path, None)
+        self._folder_saved_edit_status.pop(path, None)
+        self.filmstrip.remove_photo(path)
+        self.statusBar().showMessage(f"'{os.path.basename(path)}' moved to the Recycle Bin")
 
     # ---- Save (embedded, no sidecar — see CLAUDE.md phase 5) ----
 
@@ -6917,14 +7212,19 @@ class DNGForge(QMainWindow):
         if self.raw is None or self.raw_path is None:
             return False
         if not self.exiftool_path:
-            QMessageBox.critical(self, "Salvataggio non riuscito",
-                                  "exiftool non trovato: impossibile scrivere le modifiche nel DNG.")
+            QMessageBox.critical(self, "Save Failed",
+                                  "exiftool not found: unable to write the changes into the DNG.")
             return False
         if not self._dngconv_path:
             self._show_dngconv_missing_error()
             return False
 
-        self.statusBar().showMessage("Rendering a piena risoluzione con Adobe DNG Converter…")
+        # Wording matches Lightroom Classic's own name for this exact operation —
+        # Metadata → "Update DNG Preview & Metadata" (confirmed against Adobe's own
+        # documentation/community references, not assumed) — rather than naming the
+        # internal renderer, since that's an implementation detail of *how* this app
+        # produces the new preview, not what the operation itself conceptually is.
+        self.statusBar().showMessage("Updating DNG preview and metadata…")
         QApplication.processEvents()
         t0 = time.time()
         path = self.raw_path
@@ -6966,7 +7266,7 @@ class DNGForge(QMainWindow):
                 )
                 if jpeg_path is None:
                     raise RuntimeError(
-                        "Adobe DNG Converter non è riuscito a renderizzare le correzioni locali a piena risoluzione"
+                        "Adobe DNG Converter failed to render the local adjustments at full resolution"
                     )
             else:
                 # Shared, kept-alive exiftool process (_persistent_exiftool_execute(), see its
@@ -6987,11 +7287,11 @@ class DNGForge(QMainWindow):
                     capture_output=True, timeout=180, creationflags=_NO_WINDOW_FLAGS,
                 )
                 if result.returncode != 0 or not os.path.isfile(rendered_path):
-                    raise RuntimeError("Adobe DNG Converter non è riuscito a renderizzare il file a piena risoluzione")
+                    raise RuntimeError("Adobe DNG Converter failed to render the file at full resolution")
 
                 jpeg_path = os.path.join(render_dir, "rendered_preview.jpg")
                 if not _extract_dngconverter_preview(self.exiftool_path, rendered_path, jpeg_path):
-                    raise RuntimeError("Impossibile estrarre l'anteprima renderizzata da Adobe DNG Converter")
+                    raise RuntimeError("Unable to extract the rendered preview from Adobe DNG Converter")
                 _apply_lensfun_correction(jpeg_path, lens_correction)
 
             # Re-encode the full-resolution render at SAVE_PREVIEW_QUALITY and carve out a
@@ -7060,8 +7360,8 @@ class DNGForge(QMainWindow):
             _persistent_exiftool_execute(self.exiftool_path, *args)
 
             self.statusBar().showMessage(
-                f"Salvato in {os.path.basename(path)} ({time.time() - t0:.1f}s) — "
-                "rendering Adobe DNG Converter, coerente con Lightroom/ACR per gli stessi tag"
+                f"Saved to {os.path.basename(path)} ({time.time() - t0:.1f}s) — "
+                "rendered by Adobe DNG Converter, consistent with Lightroom/ACR for the same tags"
             )
             # Marks "this is now what's on disk" for the unsaved-changes check in closeEvent()
             # (see that method) — captured *after* the write succeeds, not before, so a failed
@@ -7075,10 +7375,15 @@ class DNGForge(QMainWindow):
             # (revert_to_saved() already handles its own case; this covers every other path
             # that can trigger a save, since they all funnel through this one function).
             self._session_edit_cache.pop(self.raw_path, None)
+            # The file now genuinely carries saved -XMP-crs:* tags (WhiteBalance is written
+            # unconditionally by every save) — update the filmstrip's own record directly
+            # rather than waiting for a future folder rescan to notice.
+            self._folder_saved_edit_status[path] = True
+            self._refresh_filmstrip_status(path)
             return True
         except Exception as e:
-            QMessageBox.critical(self, "Salvataggio non riuscito", str(e))
-            self.statusBar().showMessage("Salvataggio fallito")
+            QMessageBox.critical(self, "Save Failed", str(e))
+            self.statusBar().showMessage("Save failed")
             return False
         finally:
             if render_dir is not None:
@@ -7105,8 +7410,8 @@ class DNGForge(QMainWindow):
         if self.raw is None or self.raw_path is None:
             return
         if not self.exiftool_path:
-            QMessageBox.critical(self, "Esportazione non riuscita",
-                                  "exiftool non trovato: impossibile renderizzare l'anteprima.")
+            QMessageBox.critical(self, "Export Failed",
+                                  "exiftool not found: unable to render the preview.")
             return
         if not self._dngconv_path:
             self._show_dngconv_missing_error()
@@ -7118,8 +7423,10 @@ class DNGForge(QMainWindow):
         )
         if not out_path:
             return
+        out_path = os.path.normpath(out_path)  # same Qt forward-slash normalization as
+        # open_dng()/open_folder() — see either's own comment for why
 
-        self.statusBar().showMessage("Rendering a piena risoluzione con Adobe DNG Converter per l'esportazione…")
+        self.statusBar().showMessage("Rendering full resolution with Adobe DNG Converter for export…")
         QApplication.processEvents()
         t0 = time.time()
         render_dir = None
@@ -7149,7 +7456,7 @@ class DNGForge(QMainWindow):
                 )
                 if composited_path is None:
                     raise RuntimeError(
-                        "Adobe DNG Converter non è riuscito a renderizzare le correzioni locali a piena risoluzione"
+                        "Adobe DNG Converter failed to render the local adjustments at full resolution"
                     )
                 shutil.move(composited_path, out_path)
             else:
@@ -7167,10 +7474,10 @@ class DNGForge(QMainWindow):
                     capture_output=True, timeout=180, creationflags=_NO_WINDOW_FLAGS,
                 )
                 if result.returncode != 0 or not os.path.isfile(rendered_path):
-                    raise RuntimeError("Adobe DNG Converter non è riuscito a renderizzare il file a piena risoluzione")
+                    raise RuntimeError("Adobe DNG Converter failed to render the file at full resolution")
 
                 if not _extract_dngconverter_preview(self.exiftool_path, rendered_path, out_path):
-                    raise RuntimeError("Impossibile estrarre l'anteprima renderizzata da Adobe DNG Converter")
+                    raise RuntimeError("Unable to extract the rendered preview from Adobe DNG Converter")
                 _apply_lensfun_correction(out_path, lens_correction)
 
             # CONFIRMED BUG, fixed: the exported JPEG used to carry *no* metadata at all —
@@ -7218,15 +7525,15 @@ class DNGForge(QMainWindow):
                     "-overwrite_original", out_path,
                 )
             except Exception:
-                timestamp_note = " (metadati/timestamp non impostati: errore exiftool)"
+                timestamp_note = " (metadata/timestamp not set: exiftool error)"
 
             self.statusBar().showMessage(
-                f"Anteprima esportata in {os.path.basename(out_path)} "
+                f"Preview exported to {os.path.basename(out_path)} "
                 f"({time.time() - t0:.1f}s){timestamp_note}"
             )
         except Exception as e:
-            QMessageBox.critical(self, "Esportazione non riuscita", str(e))
-            self.statusBar().showMessage("Esportazione fallita")
+            QMessageBox.critical(self, "Export Failed", str(e))
+            self.statusBar().showMessage("Export failed")
         finally:
             if render_dir is not None:
                 shutil.rmtree(render_dir, ignore_errors=True)
@@ -7447,9 +7754,9 @@ class DNGForge(QMainWindow):
         )
         if dirty:
             reply = QMessageBox.question(
-                self, "Modifiche non salvate",
-                f"'{os.path.basename(self.raw_path)}' ha modifiche non salvate.\n\n"
-                "Salvare prima di uscire?",
+                self, "Unsaved Changes",
+                f"'{os.path.basename(self.raw_path)}' has unsaved changes.\n\n"
+                "Save before exiting?",
                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
                 QMessageBox.Save,
             )
@@ -7464,7 +7771,7 @@ class DNGForge(QMainWindow):
                     return
         else:
             reply = QMessageBox.question(
-                self, "Esci da DNGForge", "Uscire da DNGForge?",
+                self, "Exit DNGForge", "Exit DNGForge?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if reply != QMessageBox.Yes:
