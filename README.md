@@ -102,3 +102,7 @@ pythonw dng_converter_gui.pyw
 - `dng_converter_gui.pyw` — standalone batch NEF/DNG → JPG/DNG converter, see above
 - `backups/` — significant earlier versions, kept for reference
 - `reference/` — third-party code consulted as reference (not included in the repo)
+
+## License
+
+[MIT](LICENSE)
